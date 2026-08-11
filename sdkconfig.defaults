@@ -32,9 +32,10 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 # esp_codec_dev 用新 I2C master API
 CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=n
 
-# ---- USB UAC + CDC composite ----
-# AS_PART：app 自带 tusb_config.h + usb_descriptors.c（main/），组件只出 UAC 驱动逻辑
-CONFIG_USB_DEVICE_UAC_AS_PART=y
+# ---- USB UAC-only（先验证出声；CDC composite 稍后加回）----
+# non-AS_PART：用组件自带 tusb_config.h + usb_descriptors.c（跟官方 example /
+# ~/esp/s32_uac1_speaker 同一路径）。AS_PART+CDC 曾枚举成功但 audio EP 不收数据。
+# CONFIG_USB_DEVICE_UAC_AS_PART 默认 n，不要写 =y
 # 立体声放音（主机→ES8389），不做 USB 麦
 CONFIG_UAC_SPEAKER_CHANNEL_NUM=2
 CONFIG_UAC_MIC_CHANNEL_NUM=0
@@ -46,5 +47,5 @@ CONFIG_UAC_SUPPORT_MACOS=y
 CONFIG_UAC_TUSB_VID=0x303A
 CONFIG_UAC_TUSB_PID=0x80C1
 CONFIG_UAC_TUSB_MANUFACTURER="CyberFold"
-CONFIG_UAC_TUSB_PRODUCT="TypixDeck UAC+CDC"
+CONFIG_UAC_TUSB_PRODUCT="TypixDeck UAC"
 CONFIG_UAC_TUSB_SERIAL_NUM="TD0720"

@@ -33,10 +33,6 @@
 #include "aw9523.h"
 #include "lcd_spi_init.h"
 #include "audio.h"
-#include <stdarg.h>
-#include "esp_system.h"   // esp_restart()
-#include "soc/rtc_cntl_reg.h"
-#include "tusb.h"
 #include "usb_device_uac.h"
 
 static const char *TAG = "MAIN";
@@ -490,17 +486,15 @@ static esp_err_t mux_select(bool esp_side)
 }
 
 // ---------------------------------------------------------------------------
-// USB UAC + CDC
+// USB UAC-only（先验证出声；CDC composite / 魔串刷机稍后加回）
 // ---------------------------------------------------------------------------
-void cdc_printf(const char *fmt, ...);   // 前向声明（定义在下面，uac 回调里先用）
-
 // UAC: 主机 PCM → ES8389 codec
 static volatile uint32_t s_pcm_calls = 0, s_pcm_bytes = 0;
 static esp_err_t uac_output_cb(uint8_t *buf, size_t len, void *ctx)
 {
     (void)ctx;
     if (s_pcm_calls == 0) {
-        cdc_printf("[uac] FIRST PCM arrived len=%d (host is streaming)\r\n", (int)len);
+        ESP_LOGI(TAG, "FIRST PCM arrived len=%d (host is streaming)", (int)len);
     }
     s_pcm_calls++;
     s_pcm_bytes += len;
@@ -508,74 +502,27 @@ static esp_err_t uac_output_cb(uint8_t *buf, size_t len, void *ctx)
     if (codec) {
         esp_codec_dev_write(codec, buf, len);
     }
+    if ((s_pcm_calls % 1000) == 0) {
+        ESP_LOGI(TAG, "PCM #%lu calls %lu bytes",
+                 (unsigned long)s_pcm_calls, (unsigned long)s_pcm_bytes);
+    }
     return ESP_OK;
 }
 static void uac_set_mute_cb(uint32_t mute, void *ctx)
 {
     (void)ctx;
-    cdc_printf("[uac] host set mute=%lu\r\n", (unsigned long)mute);
+    ESP_LOGI(TAG, "host set mute=%lu", (unsigned long)mute);
     esp_codec_dev_set_out_mute(audio_codec_handle(), (bool)mute);
 }
 static void uac_set_volume_cb(uint32_t volume, void *ctx)
 {
     (void)ctx;
     int vol = (int)volume; if (vol > 100) vol = 100;
-    cdc_printf("[uac] host set volume=%lu -> codec %d\r\n", (unsigned long)volume, vol);
+    ESP_LOGI(TAG, "host set volume=%lu -> codec %d", (unsigned long)volume, vol);
     esp_codec_dev_set_out_vol(audio_codec_handle(), vol);
 }
 
-// CDC 调试输出（主机可见的 printf）
-void cdc_printf(const char *fmt, ...)
-{
-    if (!tud_cdc_connected()) return;
-    char buf[160];
-    va_list ap; va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    if (n > 0) {
-        tud_cdc_write(buf, n > (int)sizeof(buf) ? (int)sizeof(buf) : n);
-        tud_cdc_write_flush();
-    }
-}
-
-// 写 RTC FORCE_DOWNLOAD_BOOT + 复位 → ROM 进下载模式（esptool 无按钮刷机）
-// 借鉴 firmware/cm3_usb_wifi_dongle/main/CLI_Commands.c 的 download 命令
-static void reboot_to_download(void)
-{
-    cdc_printf("\r\n>>> Now switch to BOOT (download) mode. Run esptool to flash.\r\n");
-    vTaskDelay(pdMS_TO_TICKS(60));   // 让 CDC 把提示发出去再死
-    REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
-    esp_restart();
-}
-
-// CDC RX 回调：按行扫描 "REBOOT_TO_BOOT_MODE" 魔串
-void tud_cdc_rx_cb(uint8_t itf)
-{
-    (void)itf;
-    static char line[80];
-    static int len = 0;
-    while (tud_cdc_available()) {
-        char c;
-        if (tud_cdc_read(&c, 1) == 0) break;
-        // 简单回显
-        if (c != '\r' && c != '\n') {
-            if (tud_cdc_connected()) { tud_cdc_write(&c, 1); tud_cdc_write_flush(); }
-        }
-        if (c == '\r' || c == '\n') {
-            line[len] = 0;
-            if (strstr(line, "REBOOT_TO_BOOT_MODE")) {
-                reboot_to_download();   // 不返回
-            } else if (len > 0) {
-                cdc_printf("\r\n[echo] %s  (send REBOOT_TO_BOOT_MODE to enter flash mode)\r\n", line);
-            }
-            len = 0;
-        } else if (len < (int)sizeof(line) - 1) {
-            line[len++] = c;
-        }
-    }
-}
-
-// audio(ES8389) + USB(UAC+CDC) 初始化放独立任务跑：esp_codec_dev + tusb_init
+// audio(ES8389) + USB(UAC) 初始化放独立任务跑：esp_codec_dev + tusb_init
 // 调用栈深，app_main 的 8KB 栈会溢出 → 崩溃重启循环（lcd_mp3 也是独立任务跑的）
 static void audio_usb_task(void *arg)
 {
@@ -583,7 +530,7 @@ static void audio_usb_task(void *arg)
 
     audio_start(bus);
 
-    // AS_PART：必须给 spk_itf_num（AC=itf0, AS_spk=itf1），否则 uac 驱动用野值
+    // non-AS_PART：组件自带描述符，itf 号由组件内部填，不用给 spk_itf_num
     uac_device_config_t uac_cfg = {
         .skip_tinyusb_init = false,
         .output_cb      = uac_output_cb,
@@ -591,14 +538,9 @@ static void audio_usb_task(void *arg)
         .set_mute_cb     = uac_set_mute_cb,
         .set_volume_cb   = uac_set_volume_cb,
         .cb_ctx          = NULL,
-        .spk_itf_num     = 1,
-        .mic_itf_num     = -1,
     };
     if (uac_device_init(&uac_cfg) == ESP_OK) {
-        ESP_LOGI(TAG, "USB UAC+CDC 已启动，主机插上线即识别为声卡+CDC串口");
-        cdc_printf("\r\n=== TypixDeck UAC+CDC ready ===\r\n"
-                   "UAC: 48kHz/16bit/stereo -> ES8389\r\n"
-                   "CDC: send 'REBOOT_TO_BOOT_MODE' to enter flash mode\r\n");
+        ESP_LOGI(TAG, "USB UAC-only 已启动（48k/16bit/stereo -> ES8389）");
     } else {
         ESP_LOGE(TAG, "USB UAC 初始化失败");
     }
@@ -641,7 +583,7 @@ void app_main(void)
     ESP_LOGI(TAG, "DAC_3V3_EN(P1_0) 已驱高，ES8389 上电");
 
     // LCD SPI 初始化已完成 → GPIO47/48 现在重配成 I2S。
-    // audio(ES8389) + USB(UAC+CDC) 放独立 16KB 任务跑（栈深，避免 app_main 8KB 溢出）
+    // audio(ES8389) + USB(UAC) 放独立 16KB 任务跑（栈深，避免 app_main 8KB 溢出）
     xTaskCreate(audio_usb_task, "audio_usb", 16384, s_i2c_bus, 5, NULL);
 
     // 默认交给 Pi（CM 与 ESP 同时上电，Pi 数秒后出图）

@@ -2,4 +2,3 @@
 dependencies:
   idf: ">=5.4"
   espressif/esp_codec_dev: "^1.3.4"
-  espressif/usb_device_uac: "1.3.1"   # 锁死版本确保稳定（FS 反馈修复靠 CONFIG_UAC_SUPPORT_MACOS，与版本无关）
