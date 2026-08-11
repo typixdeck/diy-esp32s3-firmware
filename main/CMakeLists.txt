@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS "main.c" "aw9523.c" "gt911.c" "lcd_spi_init.c" "audio.c" "usb_descriptors.c"
     INCLUDE_DIRS "."
-    REQUIRES driver esp_lcd esp_timer esp_driver_i2s esp_hw_support espressif__tinyusb
+    REQUIRES driver esp_lcd esp_timer esp_driver_i2s esp_hw_support espressif__tinyusb espressif__usb_device_uac
 )
 
 # CONFIG_USB_DEVICE_UAC_AS_PART=y：组件不自带 tusb_config.h / usb_descriptors.c，

@@ -492,10 +492,18 @@ static esp_err_t mux_select(bool esp_side)
 // ---------------------------------------------------------------------------
 // USB UAC + CDC
 // ---------------------------------------------------------------------------
+void cdc_printf(const char *fmt, ...);   // 前向声明（定义在下面，uac 回调里先用）
+
 // UAC: 主机 PCM → ES8389 codec
+static volatile uint32_t s_pcm_calls = 0, s_pcm_bytes = 0;
 static esp_err_t uac_output_cb(uint8_t *buf, size_t len, void *ctx)
 {
     (void)ctx;
+    if (s_pcm_calls == 0) {
+        cdc_printf("[uac] FIRST PCM arrived len=%d (host is streaming)\r\n", (int)len);
+    }
+    s_pcm_calls++;
+    s_pcm_bytes += len;
     esp_codec_dev_handle_t codec = audio_codec_handle();
     if (codec) {
         esp_codec_dev_write(codec, buf, len);
@@ -505,12 +513,14 @@ static esp_err_t uac_output_cb(uint8_t *buf, size_t len, void *ctx)
 static void uac_set_mute_cb(uint32_t mute, void *ctx)
 {
     (void)ctx;
+    cdc_printf("[uac] host set mute=%lu\r\n", (unsigned long)mute);
     esp_codec_dev_set_out_mute(audio_codec_handle(), (bool)mute);
 }
 static void uac_set_volume_cb(uint32_t volume, void *ctx)
 {
     (void)ctx;
     int vol = (int)volume; if (vol > 100) vol = 100;
+    cdc_printf("[uac] host set volume=%lu -> codec %d\r\n", (unsigned long)volume, vol);
     esp_codec_dev_set_out_vol(audio_codec_handle(), vol);
 }
 
