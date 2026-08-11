@@ -1,0 +1,135 @@
+#include "aw9523.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "board_pins.h"
+
+static const char *TAG = "AW9523";
+
+esp_err_t aw9523_read_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *val)
+{
+    return i2c_master_transmit_receive(dev, &reg, 1, val, 1, 100);
+}
+
+esp_err_t aw9523_write_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t val)
+{
+    uint8_t buf[2] = { reg, val };
+    return i2c_master_transmit(dev, buf, 2, 100);
+}
+
+esp_err_t aw9523_update_bits(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t mask, uint8_t val)
+{
+    uint8_t cur;
+    esp_err_t err = aw9523_read_reg(dev, reg, &cur);
+    if (err != ESP_OK) {
+        return err;
+    }
+    uint8_t next = (cur & ~mask) | (val & mask);
+    if (next == cur) {
+        return ESP_OK;
+    }
+    return aw9523_write_reg(dev, reg, next);
+}
+
+esp_err_t aw9523_init(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t *out_dev)
+{
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = AW9523_I2C_ADDR,
+        .scl_speed_hz = 100 * 1000,
+    };
+    i2c_master_dev_handle_t dev;
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &dev_cfg, &dev));
+
+    // ---- 自检：读芯片 ID ----
+    uint8_t id = 0;
+    esp_err_t err = aw9523_read_reg(dev, AW9523_REG_ID, &id);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "0x5B 无应答: %s（查 R72/R87、U16 供电/RSTN 上拉）", esp_err_to_name(err));
+        return err;
+    }
+    if (id != AW9523_CHIP_ID) {
+        ESP_LOGE(TAG, "ID 寄存器 = 0x%02X，期望 0x23，芯片异常", id);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    ESP_LOGI(TAG, "AW9523B OK (ID=0x23 @0x5B)");
+
+    // ---- 配置（不做软复位，避免其它已在用的输出瞬间跳变）----
+    // 1. 屏蔽全部中断：INTN 经 R82 搭在 ESP_LCD_CS(GPIO5) 上，绝不能让它拉低
+    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_INT_P0, 0xFF));
+    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_INT_P1, 0xFF));
+    // 2. 全部端口 GPIO 模式（非 LED 电流源）
+    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_LEDMODE_P0, 0xFF));
+    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_LEDMODE_P1, 0xFF));
+    // 3. 绝对写入（不用 update_bits）——AW9523 不随 ESP 复位，寄存器会残留
+    //    上一版固件的状态，必须强制写成确定状态。
+    //    ⚠️ 只驱动真正要控的 3 根线，其余 13 脚一律输入 Hi-Z（网表逐脚核实，
+    //    见 aw9523.h / CLAUDE.md 踩坑 #15）。
+    //    CM_PMIC_EN(P0_2) 完全不驱动（输入 Hi-Z）：R79 上拉 = CM 上电自启，
+    //    ESP 与 CM 并行启动，互不干预电源。
+    //
+    //    ⚠️⚠️ 写入顺序是电源安全的关键：必须【先 CONFIG 后 OUTPUT】！
+    //    AW9523 上电默认全 16 脚输出高、ESP 热复位后残留上一次的输出状态。
+    //    若先写 OUTPUT_P0=0x01，P0_2 此刻还是输出态，会被瞬间驱成 0 →
+    //    GLOBAL_EN 打出一个低脉冲 → 刚开始启动的 CM 被掐死且 PMIC 不再自启
+    //    （实测：无论怎么重新上电 Pi 都起不来，因为每次 ESP 启动都补一刀）。
+    //    先写 CONFIG 把不要的脚全部转输入释放（此时输出寄存器仍是高/残留值，
+    //    输入态不驱动，无任何毛刺），再写 OUTPUT 只影响留下的输出脚。
+    //    （"先 OUTPUT 后 CONFIG"仅适用于上一版故意抑制 CM 上电的固件。）
+    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_CONFIG_P0,
+                                     0xFF & ~AW9523_P0_MUX_SEL));                     // 0xFE
+    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_CONFIG_P1,
+                                     0xFF & ~(AW9523_P1_LCD_RST | AW9523_P1_TP_RST)));// 0xED
+    // 4. P0 推挽输出（默认开漏推不高 MUX_SEL）。放在 CONFIG 之后：此刻 P0 只剩
+    //    P0_0 一个输出，切推挽不会波及其它脚。
+    ESP_ERROR_CHECK(aw9523_update_bits(dev, AW9523_REG_GCR, 1 << 4, 1 << 4));
+    // 5. 输出电平：MUX_SEL(P0_0)=1 先切 ESP 侧做 LCD SPI 初始化 + GT911 复位；
+    //    LCD_RST(P1_1)=1 / TP_RST(P1_4)=1 复位线保持释放
+    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_OUTPUT_P0, AW9523_P0_MUX_SEL));  // 0x01
+    ESP_ERROR_CHECK(aw9523_write_reg(dev, AW9523_REG_OUTPUT_P1,
+                                     AW9523_P1_LCD_RST | AW9523_P1_TP_RST));          // 0x12
+
+    // 回读全部关键寄存器，验证配置真的写进去了
+    struct { uint8_t reg; const char *name; } dump[] = {
+        { AW9523_REG_INPUT_P0,  "INPUT_P0 " }, { AW9523_REG_INPUT_P1,  "INPUT_P1 " },
+        { AW9523_REG_OUTPUT_P0, "OUTPUT_P0" }, { AW9523_REG_OUTPUT_P1, "OUTPUT_P1" },
+        { AW9523_REG_CONFIG_P0, "CONFIG_P0" }, { AW9523_REG_CONFIG_P1, "CONFIG_P1" },
+        { AW9523_REG_INT_P0,    "INT_P0   " }, { AW9523_REG_INT_P1,    "INT_P1   " },
+        { AW9523_REG_GCR,       "GCR      " },
+    };
+    for (int i = 0; i < sizeof(dump) / sizeof(dump[0]); i++) {
+        uint8_t v = 0;
+        aw9523_read_reg(dev, dump[i].reg, &v);
+        ESP_LOGI(TAG, "  [0x%02X] %s = 0x%02X", dump[i].reg, dump[i].name, v);
+    }
+    ESP_LOGI(TAG, "MUX_SEL(P0_0)=1 已切 ESP 侧, CM_PMIC_EN(P0_2)=输入Hi-Z(CM 自启不干预), "
+                  "LCD_RST(P1_1)=1, TP_RST(P1_4)=1, 其余 13 脚全输入 Hi-Z");
+
+    *out_dev = dev;
+    return ESP_OK;
+}
+
+// GT911 复位（INT 拉低贯穿 → 地址 0x5D）。
+// 实测：GT911 固件启动阶段 INT 必须为低；INT 悬空被 R20 拉高时固件进异常态
+// （Sensor_ID=0xFF、配置区全 0、拒绝采纳配置）。INT 只在复位期间短暂驱动，
+// 结束立即还回输入交还 GT911。
+esp_err_t aw9523_gt911_reset(i2c_master_dev_handle_t dev)
+{
+    // RST=0、INT=0（INT 暂时改输出低，R20 10K 上拉下灌 ~0.33mA 无害）
+    ESP_ERROR_CHECK(aw9523_update_bits(dev, AW9523_REG_OUTPUT_P1,
+                                       AW9523_P1_TP_RST | AW9523_P1_TP_INT, 0x00));
+    ESP_ERROR_CHECK(aw9523_update_bits(dev, AW9523_REG_CONFIG_P1,
+                                       AW9523_P1_TP_INT, 0x00));   // INT 转输出
+    vTaskDelay(pdMS_TO_TICKS(20));
+    // 释放 RST，INT 保持低 → 固件以 0x5D 地址干净重启（NVM 厂家配置正常加载）
+    ESP_ERROR_CHECK(aw9523_update_bits(dev, AW9523_REG_OUTPUT_P1,
+                                       AW9523_P1_TP_RST, AW9523_P1_TP_RST));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    // INT 还回输入（高阻，交还 GT911 驱动）
+    ESP_ERROR_CHECK(aw9523_update_bits(dev, AW9523_REG_CONFIG_P1,
+                                       AW9523_P1_TP_INT, AW9523_P1_TP_INT));
+    vTaskDelay(pdMS_TO_TICKS(120));
+    return ESP_OK;
+}
+
