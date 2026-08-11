@@ -1,5 +1,12 @@
 # 交接文档：ESP32-S3 USB UAC+CDC 声卡固件（卡在 UAC 音频 EP 不收数据）
 
+> ✅ **已解决（2026-08-12）**：根因不在固件，是 **CM4 主机侧 dwc2 驱动的
+> split-ISO OUT 调度问题**。macOS 走同一颗 hub 出声完美 → 锁定主机；
+> `[cm4]` 段改 `otg_mode=1`（BCM2711 内置 XHCI）后 Pi 稳定出声。
+> 详见 `docs/cm4_dwc2_uac_no_audio_xhci_fix_2026-08.md` 和 CLAUDE.md 踩坑 #17。
+> 固件现为纯 UAC（non-AS_PART，commit `bb87ded`），CDC 魔串待加回。
+> 以下为历史排查记录，其中"hub TT 嫌疑"的方向已被证伪。
+
 > 接手者：Fable5。这份文档汇总了**当前状态 + 全部历史踩坑 + 未解问题 + 关键文件/命令**，可直接上手无需重新摸索。
 
 ---
