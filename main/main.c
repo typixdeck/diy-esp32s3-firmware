@@ -547,6 +547,48 @@ static void audio_usb_task(void *arg)
     vTaskDelete(NULL);
 }
 
+// ---------------------------------------------------------------------------
+// 功放(NS4150) + 耳机检测
+// 功放电源+使能 AW9523 P1_3(AMP_4V6_EN)：HIGH=开(R119 默认上拉)，LOW=关。
+//   P1_3 经 R203 同时控 U28(4V6 电源开关) 和 NS4150 EN(U2.1/U40.1)，一拉低全断。
+// 耳机检测 AW9523 P1_7(HP_DET)：输入，R166 上拉到 AUDIO_3V3，CN10.1 插入接地
+//   → LOW=插了，HIGH=没插。
+// 逻辑：插耳机 → 关功放（避免喇叭也响）；拔出 → 开功放。
+// ---------------------------------------------------------------------------
+static void amp_power(bool on)
+{
+    // 只动 bit3：先写目标电平再转输出（无毛刺）
+    aw9523_update_bits(s_aw9523, AW9523_REG_OUTPUT_P1, AW9523_P1_AMP_4V6_EN,
+                       on ? AW9523_P1_AMP_4V6_EN : 0);
+    aw9523_update_bits(s_aw9523, AW9523_REG_CONFIG_P1, AW9523_P1_AMP_4V6_EN, 0);
+    ESP_LOGI(TAG, "功放 %s", on ? "开" : "关");
+}
+
+static bool headphone_plugged(void)
+{
+    uint8_t in = 0;
+    aw9523_read_reg(s_aw9523, AW9523_REG_INPUT_P1, &in);
+    return (in & AW9523_P1_HP_DET) == 0;   // LOW = 插了
+}
+
+static void hp_amp_task(void *arg)
+{
+    bool plugged = headphone_plugged();
+    amp_power(!plugged);                    // 开机按当前状态设一次
+    ESP_LOGI(TAG, "耳机检测启动：%s", plugged ? "已插→功放关" : "未插→功放开");
+    while (1) {
+        bool now = headphone_plugged();
+        if (now != plugged) {
+            vTaskDelay(pdMS_TO_TICKS(50));   // 二次确认去抖
+            if (headphone_plugged() == now) {
+                plugged = now;
+                amp_power(!plugged);         // 插→关；拔→开
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));      // 5Hz 轮询
+    }
+}
+
 void app_main(void)
 {
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -581,6 +623,9 @@ void app_main(void)
     aw9523_update_bits(s_aw9523, AW9523_REG_CONFIG_P1, AW9523_P1_DAC_3V3_EN, 0);
     vTaskDelay(pdMS_TO_TICKS(200));
     ESP_LOGI(TAG, "DAC_3V3_EN(P1_0) 已驱高，ES8389 上电");
+
+    // 功放 + 耳机检测：轮询 HP_DET(P1_7)，插耳机关功放、拔出开功放
+    xTaskCreate(hp_amp_task, "hp_amp", 4096, NULL, 5, NULL);
 
     // LCD SPI 初始化已完成 → GPIO47/48 现在重配成 I2S。
     // audio(ES8389) + USB(UAC) 放独立 16KB 任务跑（栈深，避免 app_main 8KB 溢出）
