@@ -518,6 +518,31 @@ static esp_err_t uac_output_cb(uint8_t *buf, size_t len, void *ctx)
     }
     return ESP_OK;
 }
+// UAC mic: ES8389 ADC（双 MEMS 麦 MIC3/MIC4）→ 主机。
+// 组件 usb_mic_task 每 MIC_INTERVAL_MS 调一次：len = 主机要的字节数，
+// esp_codec_dev_read 阻塞到读满（I2S DMA 节奏天然按 48k 走），写 *bytes_read。
+static volatile uint32_t s_mic_calls = 0, s_mic_bytes = 0;
+static esp_err_t uac_input_cb(uint8_t *buf, size_t len, size_t *bytes_read, void *ctx)
+{
+    (void)ctx;
+    esp_codec_dev_handle_t codec = audio_codec_handle();
+    if (!codec) {
+        memset(buf, 0, len);
+        *bytes_read = len;
+        return ESP_OK;
+    }
+    if (s_mic_calls == 0) {
+        ESP_LOGI(TAG, "FIRST MIC read len=%d (host is capturing)", (int)len);
+    }
+    int ret = esp_codec_dev_read(codec, buf, len);
+    if (ret != ESP_CODEC_DEV_OK) {
+        memset(buf, 0, len);   // 读失败发静音，不断流
+    }
+    *bytes_read = len;
+    s_mic_calls++;
+    s_mic_bytes += len;
+    return ESP_OK;
+}
 static void uac_set_mute_cb(uint32_t mute, void *ctx)
 {
     (void)ctx;
@@ -536,6 +561,8 @@ static void uac_set_volume_cb(uint32_t volume, void *ctx)
 // CDC：魔串刷机 + 1Hz 包统计输出
 // ---------------------------------------------------------------------------
 static volatile bool s_reboot_to_boot = false;   // rx_cb 置位，stats 任务执行
+static volatile bool s_audio_dump = false;       // AUDIO_DUMP：打印功放/耳机/ES8389 寄存器
+static volatile int  s_amp_force = 0;            // AMP_ON=1 / AMP_OFF=-1（诊断用，stats 任务消费后清零）
 
 // tinyusb 任务上下文：只收集行、置标志，不调任何 CDC 写 API
 void tud_cdc_rx_cb(uint8_t itf)
@@ -550,6 +577,12 @@ void tud_cdc_rx_cb(uint8_t itf)
             line[pos] = '\0';
             if (pos && strstr(line, "REBOOT_TO_BOOT_MODE")) {
                 s_reboot_to_boot = true;
+            } else if (pos && strstr(line, "AUDIO_DUMP")) {
+                s_audio_dump = true;
+            } else if (pos && strstr(line, "AMP_ON")) {
+                s_amp_force = 1;
+            } else if (pos && strstr(line, "AMP_OFF")) {
+                s_amp_force = -1;
             }
             pos = 0;
         } else if (pos < sizeof(line) - 1) {
@@ -558,13 +591,47 @@ void tud_cdc_rx_cb(uint8_t itf)
     }
 }
 
+static void amp_power(bool on);        // 前向声明（诊断魔串用）
+static bool headphone_plugged(void);
+
+// 诊断输出：仅在 cdc_stats_task 上下文调用（I2C 驱动带锁，跨任务安全）
+static void cdc_audio_dump(void)
+{
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "\r\n--- AUDIO_DUMP ---\r\nHP_DET plugged=%d\r\n",
+                     headphone_plugged() ? 1 : 0);
+    tud_cdc_write(buf, (uint32_t)n);
+    // ES8389 关键寄存器：0x00 复位 / 0x10 电源 / 0x20 ADC SP / 0x26-28 ADC 音量 /
+    // 0x61/64/69 模拟 / 0x72/73 PGA（InputSel+增益）/ 0x40 DAC SP / 0xF0 misc
+    static const uint8_t regs[] = { 0x00, 0x01, 0x02, 0x03, 0x10, 0x20, 0x21, 0x22, 0x23,
+                                    0x26, 0x27, 0x28, 0x2A, 0x40, 0x60, 0x61, 0x62, 0x64,
+                                    0x69, 0x6D, 0x72, 0x73, 0xF0, 0xF1 };
+    esp_codec_dev_handle_t codec = audio_codec_handle();
+    if (!codec) {
+        const char *msg = "codec handle NULL\r\n";
+        tud_cdc_write(msg, strlen(msg));
+    } else {
+        for (size_t i = 0; i < sizeof(regs); i++) {
+            int val = -1;
+            esp_codec_dev_read_reg(codec, regs[i], &val);
+            n = snprintf(buf, sizeof(buf), "reg[0x%02X]=0x%02X%s", regs[i], val & 0xFF,
+                         (i % 6 == 5 || i == sizeof(regs) - 1) ? "\r\n" : " ");
+            tud_cdc_write(buf, (uint32_t)n);
+            tud_cdc_write_flush();
+        }
+    }
+    const char *end = "--- END ---\r\n";
+    tud_cdc_write(end, strlen(end));
+    tud_cdc_write_flush();
+}
+
 // 独立任务：唯一允许调 tud_cdc_write 的地方
 static void cdc_stats_task(void *arg)
 {
     (void)arg;
-    char buf[256];
+    char buf[320];
     uac_dbg_stats_t prev = { 0 };
-    uint32_t prev_calls = 0, prev_bytes = 0;
+    uint32_t prev_calls = 0, prev_bytes = 0, prev_mic_calls = 0;
     uint32_t tick = 0;
     bool greeted = false;
 
@@ -583,9 +650,25 @@ static void cdc_stats_task(void *arg)
             esp_restart();
         }
 
+        if (s_amp_force) {
+            bool on = s_amp_force > 0;
+            s_amp_force = 0;
+            amp_power(on);
+            if (tud_cdc_connected()) {
+                char m[48];
+                int k = snprintf(m, sizeof(m), "\r\nAMP force %s\r\n", on ? "ON" : "OFF");
+                tud_cdc_write(m, (uint32_t)k);
+                tud_cdc_write_flush();
+            }
+        }
+
         if (!tud_cdc_connected()) {
             greeted = false;
             continue;
+        }
+        if (s_audio_dump) {
+            s_audio_dump = false;
+            cdc_audio_dump();
         }
         if (!greeted) {
             greeted = true;
@@ -598,9 +681,11 @@ static void cdc_stats_task(void *arg)
         // 快照 + 增量（写方只自增，读撕裂无碍）
         uac_dbg_stats_t cur = g_uac_dbg;
         uint32_t calls = s_pcm_calls, bytes = s_pcm_bytes;
+        uint32_t mcalls = s_mic_calls;
         int n = snprintf(buf, sizeof(buf),
             "[%lu] rx=%lu pkt/s %lu B/s sz=%lu..%lu gap>1.5ms=%lu maxgap=%luus "
-            "clr=%lu | cb=%lu/s | itf open=%lu close=%lu mnt=%lu sus=%lu\r\n",
+            "clr=%lu | cb=%lu/s | tx=%lu pkt/s %lu B/s mic_cb=%lu/s | "
+            "itf open=%lu close=%lu mnt=%lu sus=%lu\r\n",
             (unsigned long)tick,
             (unsigned long)(cur.rx_pkts - prev.rx_pkts),
             (unsigned long)(cur.rx_bytes - prev.rx_bytes),
@@ -610,6 +695,9 @@ static void cdc_stats_task(void *arg)
             (unsigned long)cur.rx_max_gap_us,
             (unsigned long)cur.fifo_clear,
             (unsigned long)(calls - prev_calls),
+            (unsigned long)(cur.tx_pkts - prev.tx_pkts),
+            (unsigned long)(cur.tx_bytes - prev.tx_bytes),
+            (unsigned long)(mcalls - prev_mic_calls),
             (unsigned long)cur.set_itf,
             (unsigned long)cur.itf_close,
             (unsigned long)cur.mount,
@@ -621,6 +709,7 @@ static void cdc_stats_task(void *arg)
         prev = cur;
         prev_calls = calls;
         prev_bytes = bytes;
+        prev_mic_calls = mcalls;
         (void)prev_bytes;
     }
 }
@@ -637,13 +726,13 @@ static void audio_usb_task(void *arg)
     uac_device_config_t uac_cfg = {
         .skip_tinyusb_init = false,
         .output_cb      = uac_output_cb,
-        .input_cb        = NULL,
+        .input_cb        = uac_input_cb,   // 双 MEMS 麦 → ES8389 ADC → 主机
         .set_mute_cb     = uac_set_mute_cb,
         .set_volume_cb   = uac_set_volume_cb,
         .cb_ctx          = NULL,
     };
     if (uac_device_init(&uac_cfg) == ESP_OK) {
-        ESP_LOGI(TAG, "USB UAC+CDC 已启动（48k/16bit/stereo -> ES8389 + CDC 统计口）");
+        ESP_LOGI(TAG, "USB UAC+CDC 已启动（48k/16bit/stereo 放音+录音 <-> ES8389 + CDC 统计口）");
         // CDC 统计任务在 tusb_init 之后才启动（优先级低于 tinyusb 任务）
         xTaskCreate(cdc_stats_task, "cdc_stats", 4096, NULL, 3, NULL);
     } else {
