@@ -80,6 +80,14 @@ extern "C" {
 // Enable Device stack
 #define CFG_TUD_ENABLED       1
 
+//--------------------------------------------------------------------
+// CDC debug console（UAC+CDC composite：包统计仪表 + REBOOT_TO_BOOT_MODE 魔串刷机）
+//--------------------------------------------------------------------
+#define CFG_TUD_CDC               1
+#define CFG_TUD_CDC_RX_BUFSIZE    256
+#define CFG_TUD_CDC_TX_BUFSIZE    1024
+#define CFG_TUD_CDC_EP_BUFSIZE    64
+
 /* USB DMA on some MCUs can only access a specific SRAM region with restriction on alignment.
  * Tinyusb use follows macros to declare transferring memory so that they can be put
  * into those specific section.

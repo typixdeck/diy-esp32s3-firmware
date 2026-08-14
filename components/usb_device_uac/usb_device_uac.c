@@ -16,8 +16,12 @@
 #include "uac_config.h"
 #include "usb_device_uac.h"
 #include "uac_descriptors.h"
+#include "uac_dbg.h"
 
 static const char *TAG = "usbd_uac";
+
+// 调试统计（见 uac_dbg.h 并发规则：此文件里只做原子自增/赋值）
+uac_dbg_stats_t g_uac_dbg = { .rx_min = UINT32_MAX };
 
 const uint32_t sample_rates[] = {DEFAULT_SAMPLE_RATE};
 
@@ -99,12 +103,14 @@ void tud_mount_cb(void)
 {
     s_uac_device->spk_active = false;
     s_uac_device->mic_active = false;
+    g_uac_dbg.mount++;
     ESP_LOGI(TAG, "USB mounted");
 }
 
 // Invoked when device is unmounted
 void tud_umount_cb(void)
 {
+    g_uac_dbg.umount++;
     ESP_LOGI(TAG, "USB unmounted");
 }
 
@@ -116,12 +122,14 @@ void tud_suspend_cb(bool remote_wakeup_en)
     (void)remote_wakeup_en;
     s_uac_device->spk_active = false;
     s_uac_device->mic_active = false;
+    g_uac_dbg.suspend++;
     ESP_LOGI(TAG, "USB suspended");
 }
 
 // Invoked when usb bus is resumed
 void tud_resume_cb(void)
 {
+    g_uac_dbg.resume++;
     ESP_LOGI(TAG, "USB resumed");
 }
 #endif
@@ -317,6 +325,7 @@ bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const 
         TU_LOG2("Speaker interface closed");
         s_uac_device->spk_data_size = 0;
         s_uac_device->spk_active = false;
+        g_uac_dbg.itf_close++;
     }
 #endif
 
@@ -345,6 +354,7 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
         s_uac_device->spk_resolution = spk_resolutions_per_format[alt - 1];
         s_uac_device->spk_active = true;
         s_uac_device->spk_bytes_per_ms = s_uac_device->current_sample_rate / 1000 * SPEAK_CHANNEL_NUM * CFG_TUD_AUDIO_FUNC_1_FORMAT_1_N_BYTES_PER_SAMPLE_RX;
+        g_uac_dbg.set_itf++;
         xTaskNotifyGive(s_uac_device->spk_task_handle);
         TU_LOG1("Speaker interface %d-%d opened", itf, alt);
         printf("Speaker interface %d-%d opened\n", itf, alt);
@@ -376,6 +386,20 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
     static int64_t last_time = 0;
     int64_t now = esp_timer_get_time();
 
+    // ---- 调试统计（只做原子自增/赋值，见 uac_dbg.h）----
+    g_uac_dbg.rx_pkts++;
+    g_uac_dbg.rx_bytes += n_bytes_received;
+    if (n_bytes_received < g_uac_dbg.rx_min) g_uac_dbg.rx_min = n_bytes_received;
+    if (n_bytes_received > g_uac_dbg.rx_max) g_uac_dbg.rx_max = n_bytes_received;
+    if (last_time != 0) {
+        int64_t gap = now - last_time;
+        // 只统计流内间隔（<new_play 阈值）；>1.5ms = 主机丢了至少一个 1ms 微帧
+        if (gap < 100 * CONFIG_UAC_SPK_NEW_PLAY_INTERVAL) {
+            if (gap > 1500) g_uac_dbg.rx_gap_over++;
+            if ((uint32_t)gap > g_uac_dbg.rx_max_gap_us) g_uac_dbg.rx_max_gap_us = (uint32_t)gap;
+        }
+    }
+
     /**
      * @brief If no data is received for a certain period, it is considered as the initiation
      *        of a new audio transmission. At this point, the FIFO data is cleared, and a segment
@@ -383,6 +407,7 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
      */
     if (now - last_time > 100 * CONFIG_UAC_SPK_NEW_PLAY_INTERVAL) {
         new_play = true;
+        g_uac_dbg.fifo_clear++;
         tud_audio_n_clear_ep_out_ff(func_id);
     }
     last_time = now;

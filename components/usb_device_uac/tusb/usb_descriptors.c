@@ -63,16 +63,34 @@ uint8_t const *tud_descriptor_device_cb(void)
 //--------------------------------------------------------------------+
 // Configuration Descriptor
 //--------------------------------------------------------------------+
-#define CONFIG_TOTAL_LEN        (TUD_CONFIG_DESC_LEN + CFG_TUD_AUDIO * TUD_AUDIO_DEVICE_DESC_LEN)
+#define CONFIG_TOTAL_LEN        (TUD_CONFIG_DESC_LEN + CFG_TUD_AUDIO * TUD_AUDIO_DEVICE_DESC_LEN \
+                                 + CFG_TUD_CDC * TUD_CDC_DESC_LEN)
 #define EPNUM_AUDIO_OUT   0x01
 #define EPNUM_AUDIO_FB    0x81
 #define EPNUM_AUDIO_IN    0x82
 
+// CDC 接口跟在 UAC 后面（spk-only 时 UAC 占 itf 0/1，CDC=2/3）。
+// spk-only 描述符宏不使用 EPNUM_AUDIO_IN(0x82)，故 0x82 给 CDC notify——
+// 与曾经枚举成功的 AS_PART composite 完全相同的端点布局。
+enum {
+    ITF_NUM_CDC_COMM = ITF_NUM_TOTAL,
+    ITF_NUM_CDC_DATA,
+    ITF_NUM_TOTAL_COMPOSITE,
+};
+#define EPNUM_CDC_NOTIFY  0x82
+#define EPNUM_CDC_OUT     0x03
+#define EPNUM_CDC_IN      0x83
+// CDC 接口字符串索引 = 现有字符串表末尾（lang/mfr/prod/serial/"usb uac" = 0..4，
+// 之后 speaker / microphone 按配置各占一个）
+#define STRID_CDC  (5 + (SPEAK_CHANNEL_NUM ? 1 : 0) + (MIC_CHANNEL_NUM ? 1 : 0))
+
 uint8_t const desc_configuration[] = {
     // Config number, interface count, string index, total length, attribute, power in mA
-    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
+    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL_COMPOSITE, 0, CONFIG_TOTAL_LEN, 0x00, 100),
     // Interface number, string index, EP Out & EP In address, EP size
     TUD_AUDIO_DESCRIPTOR(ITF_NUM_AUDIO_CONTROL, 4, EPNUM_AUDIO_OUT, EPNUM_AUDIO_IN, EPNUM_AUDIO_FB),
+    // CDC: comm + data（宏自带 IAD），notify 8B，bulk 64B（FS）
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC_COMM, STRID_CDC, EPNUM_CDC_NOTIFY, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
 };
 
 // Invoked when received GET CONFIGURATION DESCRIPTOR
@@ -101,6 +119,7 @@ char const *string_desc_arr [] = {
 #if MIC_CHANNEL_NUM
     "microphone",                   // 6: Mic Interface
 #endif
+    "cdc debug",                    // STRID_CDC: CDC Interface
 };
 
 static uint16_t _desc_str[32];

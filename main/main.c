@@ -34,6 +34,10 @@
 #include "lcd_spi_init.h"
 #include "audio.h"
 #include "usb_device_uac.h"
+#include "uac_dbg.h"
+#include "tusb.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp_system.h"
 
 static const char *TAG = "MAIN";
 
@@ -486,7 +490,13 @@ static esp_err_t mux_select(bool esp_side)
 }
 
 // ---------------------------------------------------------------------------
-// USB UAC-only（先验证出声；CDC composite / 魔串刷机稍后加回）
+// USB UAC + CDC composite（CDC = 包统计仪表 + REBOOT_TO_BOOT_MODE 魔串刷机）
+//
+// ⚠️ 并发纪律（历史教训：tinyusb 任务回调里调 cdc_printf → 重入死锁，
+//    控制传输全 STALL，见 HANDOFF_UAC_AUDIO.md 踩坑 #9）：
+//    - tinyusb 任务 / ISR 上下文（uac 回调、tud_cdc_rx_cb）只写计数器/标志位；
+//    - 所有 tud_cdc_write 集中在独立的 cdc_stats_task 里做（tinyusb 的 FIFO
+//      带 FreeRTOS 互斥，跨任务写入是官方支持路径）。
 // ---------------------------------------------------------------------------
 // UAC: 主机 PCM → ES8389 codec
 static volatile uint32_t s_pcm_calls = 0, s_pcm_bytes = 0;
@@ -522,7 +532,100 @@ static void uac_set_volume_cb(uint32_t volume, void *ctx)
     esp_codec_dev_set_out_vol(audio_codec_handle(), vol);
 }
 
-// audio(ES8389) + USB(UAC) 初始化放独立任务跑：esp_codec_dev + tusb_init
+// ---------------------------------------------------------------------------
+// CDC：魔串刷机 + 1Hz 包统计输出
+// ---------------------------------------------------------------------------
+static volatile bool s_reboot_to_boot = false;   // rx_cb 置位，stats 任务执行
+
+// tinyusb 任务上下文：只收集行、置标志，不调任何 CDC 写 API
+void tud_cdc_rx_cb(uint8_t itf)
+{
+    (void)itf;
+    static char line[64];
+    static size_t pos = 0;
+    while (tud_cdc_available()) {
+        char c;
+        if (tud_cdc_read(&c, 1) == 0) break;
+        if (c == '\r' || c == '\n') {
+            line[pos] = '\0';
+            if (pos && strstr(line, "REBOOT_TO_BOOT_MODE")) {
+                s_reboot_to_boot = true;
+            }
+            pos = 0;
+        } else if (pos < sizeof(line) - 1) {
+            line[pos++] = c;
+        }
+    }
+}
+
+// 独立任务：唯一允许调 tud_cdc_write 的地方
+static void cdc_stats_task(void *arg)
+{
+    (void)arg;
+    char buf[256];
+    uac_dbg_stats_t prev = { 0 };
+    uint32_t prev_calls = 0, prev_bytes = 0;
+    uint32_t tick = 0;
+    bool greeted = false;
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        tick++;
+
+        if (s_reboot_to_boot) {
+            if (tud_cdc_connected()) {
+                const char *msg = "\r\n>>> REBOOT_TO_BOOT_MODE: entering download mode, run esptool now\r\n";
+                tud_cdc_write(msg, strlen(msg));
+                tud_cdc_write_flush();
+                vTaskDelay(pdMS_TO_TICKS(80));   // 让 CDC 把提示发出去再死
+            }
+            REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+            esp_restart();
+        }
+
+        if (!tud_cdc_connected()) {
+            greeted = false;
+            continue;
+        }
+        if (!greeted) {
+            greeted = true;
+            const char *hello = "\r\n=== TypixDeck UAC+CDC stats (1Hz) ===\r\n"
+                                "send REBOOT_TO_BOOT_MODE to enter flash mode\r\n";
+            tud_cdc_write(hello, strlen(hello));
+            tud_cdc_write_flush();
+        }
+
+        // 快照 + 增量（写方只自增，读撕裂无碍）
+        uac_dbg_stats_t cur = g_uac_dbg;
+        uint32_t calls = s_pcm_calls, bytes = s_pcm_bytes;
+        int n = snprintf(buf, sizeof(buf),
+            "[%lu] rx=%lu pkt/s %lu B/s sz=%lu..%lu gap>1.5ms=%lu maxgap=%luus "
+            "clr=%lu | cb=%lu/s | itf open=%lu close=%lu mnt=%lu sus=%lu\r\n",
+            (unsigned long)tick,
+            (unsigned long)(cur.rx_pkts - prev.rx_pkts),
+            (unsigned long)(cur.rx_bytes - prev.rx_bytes),
+            (unsigned long)(cur.rx_min == UINT32_MAX ? 0 : cur.rx_min),
+            (unsigned long)cur.rx_max,
+            (unsigned long)cur.rx_gap_over,
+            (unsigned long)cur.rx_max_gap_us,
+            (unsigned long)cur.fifo_clear,
+            (unsigned long)(calls - prev_calls),
+            (unsigned long)cur.set_itf,
+            (unsigned long)cur.itf_close,
+            (unsigned long)cur.mount,
+            (unsigned long)cur.suspend);
+        if (n > 0) {
+            tud_cdc_write(buf, (uint32_t)n);
+            tud_cdc_write_flush();
+        }
+        prev = cur;
+        prev_calls = calls;
+        prev_bytes = bytes;
+        (void)prev_bytes;
+    }
+}
+
+// audio(ES8389) + USB(UAC+CDC) 初始化放独立任务跑：esp_codec_dev + tusb_init
 // 调用栈深，app_main 的 8KB 栈会溢出 → 崩溃重启循环（lcd_mp3 也是独立任务跑的）
 static void audio_usb_task(void *arg)
 {
@@ -540,7 +643,9 @@ static void audio_usb_task(void *arg)
         .cb_ctx          = NULL,
     };
     if (uac_device_init(&uac_cfg) == ESP_OK) {
-        ESP_LOGI(TAG, "USB UAC-only 已启动（48k/16bit/stereo -> ES8389）");
+        ESP_LOGI(TAG, "USB UAC+CDC 已启动（48k/16bit/stereo -> ES8389 + CDC 统计口）");
+        // CDC 统计任务在 tusb_init 之后才启动（优先级低于 tinyusb 任务）
+        xTaskCreate(cdc_stats_task, "cdc_stats", 4096, NULL, 3, NULL);
     } else {
         ESP_LOGE(TAG, "USB UAC 初始化失败");
     }
