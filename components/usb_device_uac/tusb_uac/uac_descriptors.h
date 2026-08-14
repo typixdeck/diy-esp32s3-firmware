@@ -76,6 +76,14 @@ enum {
 #error "SPEAK_CHANNEL_NUM and MIC_CHANNEL_NUM cannot both be 0"
 #endif
 
+// mic 声道位图必须与 bNrChannels 一致：2ch 用 FL|FR（上游硬编码 FRONT_CENTER
+// 只对 1ch 正确）
+#if MIC_CHANNEL_NUM == 2
+#define MIC_CHANNEL_CONFIG (AUDIO_CHANNEL_CONFIG_FRONT_LEFT | AUDIO_CHANNEL_CONFIG_FRONT_RIGHT)
+#else
+#define MIC_CHANNEL_CONFIG AUDIO_CHANNEL_CONFIG_FRONT_CENTER
+#endif
+
 #if SPEAK_CHANNEL_NUM && MIC_CHANNEL_NUM
 #define TUD_AUDIO_DESC_CS_AC_TOTAL_LEN ( \
     TUD_AUDIO_DESC_CLK_SRC_LEN\
@@ -178,7 +186,7 @@ enum {
     /* Output Terminal Descriptor(4.7.2.5) */\
     TUD_AUDIO_DESC_OUTPUT_TERM(/*_termid*/ UAC2_ENTITY_SPK_OUTPUT_TERMINAL, /*_termtype*/ AUDIO_TERM_TYPE_OUT_GENERIC_SPEAKER, /*_assocTerm*/ 0x00, /*_srcid*/ UAC2_ENTITY_SPK_FEATURE_UNIT, /*_clkid*/ UAC2_ENTITY_CLOCK, /*_ctrl*/ 0x0000, /*_stridx*/ 0x00),\
     /* Input Terminal Descriptor(4.7.2.4) */\
-    TUD_AUDIO_DESC_INPUT_TERM(/*_termid*/ UAC2_ENTITY_MIC_INPUT_TERMINAL, /*_termtype*/ AUDIO_TERM_TYPE_IN_GENERIC_MIC, /*_assocTerm*/ UAC2_ENTITY_MIC_OUTPUT_TERMINAL, /*_clkid*/ UAC2_ENTITY_CLOCK, /*_nchannelslogical*/ MIC_CHANNEL_NUM, /*_channelcfg*/ AUDIO_CHANNEL_CONFIG_FRONT_CENTER, /*_idxchannelnames*/ 0x00, /*_ctrl*/ (AUDIO_CTRL_R << AUDIO_IN_TERM_CTRL_CONNECTOR_POS), /*_stridx*/ 0x00),\
+    TUD_AUDIO_DESC_INPUT_TERM(/*_termid*/ UAC2_ENTITY_MIC_INPUT_TERMINAL, /*_termtype*/ AUDIO_TERM_TYPE_IN_GENERIC_MIC, /*_assocTerm*/ UAC2_ENTITY_MIC_OUTPUT_TERMINAL, /*_clkid*/ UAC2_ENTITY_CLOCK, /*_nchannelslogical*/ MIC_CHANNEL_NUM, /*_channelcfg*/ MIC_CHANNEL_CONFIG, /*_idxchannelnames*/ 0x00, /*_ctrl*/ (AUDIO_CTRL_R << AUDIO_IN_TERM_CTRL_CONNECTOR_POS), /*_stridx*/ 0x00),\
     /* Output Terminal Descriptor(4.7.2.5) */\
     TUD_AUDIO_DESC_OUTPUT_TERM(/*_termid*/ UAC2_ENTITY_MIC_OUTPUT_TERMINAL, /*_termtype*/ AUDIO_TERM_TYPE_USB_STREAMING, /*_assocTerm*/ 0x00, /*_srcid*/ UAC2_ENTITY_MIC_INPUT_TERMINAL, /*_clkid*/ UAC2_ENTITY_CLOCK, /*_ctrl*/ 0x0000, /*_stridx*/ 0x00),\
     TUD_AUDIO_DESC_FEATURE_UNIT_N_CHANNEL(/*_length*/ TUD_AUDIO_DESC_MIC_FEATURE_UNIT_N_CHANNEL_LEN, /*_unitid*/ UAC2_ENTITY_MIC_FEATURE_TERMINAL, /*_srcid*/ UAC2_ENTITY_MIC_INPUT_TERMINAL, /*_stridx*/ 0x00, MIC_CTRL),\
@@ -205,7 +213,7 @@ enum {
     /* Interface 2, Alternate 1 - alternate interface for data streaming */\
     TUD_AUDIO_DESC_STD_AS_INT(/*_itfnum*/ _itfnum + 2, /*_altset*/ 0x01, /*_nEPs*/ 0x01, /*_stridx*/ _stridx + 2),\
     /* Class-Specific AS Interface Descriptor(4.9.2) */\
-    TUD_AUDIO_DESC_CS_AS_INT(/*_termid*/ UAC2_ENTITY_MIC_OUTPUT_TERMINAL, /*_ctrl*/ AUDIO_CTRL_NONE, /*_formattype*/ AUDIO_FORMAT_TYPE_I, /*_formats*/ AUDIO_DATA_FORMAT_TYPE_I_PCM, /*_nchannelsphysical*/ MIC_CHANNEL_NUM, /*_channelcfg*/ AUDIO_CHANNEL_CONFIG_FRONT_CENTER, /*_stridx*/ 0x00),\
+    TUD_AUDIO_DESC_CS_AS_INT(/*_termid*/ UAC2_ENTITY_MIC_OUTPUT_TERMINAL, /*_ctrl*/ AUDIO_CTRL_NONE, /*_formattype*/ AUDIO_FORMAT_TYPE_I, /*_formats*/ AUDIO_DATA_FORMAT_TYPE_I_PCM, /*_nchannelsphysical*/ MIC_CHANNEL_NUM, /*_channelcfg*/ MIC_CHANNEL_CONFIG, /*_stridx*/ 0x00),\
     /* Type I Format Type Descriptor(2.3.1.6 - Audio Formats) */\
     TUD_AUDIO_DESC_TYPE_I_FORMAT(CFG_TUD_AUDIO_FUNC_1_FORMAT_1_N_BYTES_PER_SAMPLE_TX, CFG_TUD_AUDIO_FUNC_1_FORMAT_1_RESOLUTION_TX),\
     /* Standard AS Isochronous Audio Data Endpoint Descriptor(4.10.1.1) */\

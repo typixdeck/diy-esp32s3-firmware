@@ -17,6 +17,10 @@ typedef struct {
     volatile uint32_t rx_gap_over;    // 流内相邻包间隔 >1.5ms 的次数（丢 1ms 微帧的痕迹）
     volatile uint32_t rx_max_gap_us;  // 流内最大包间隔（µs）
     volatile uint32_t fifo_clear;     // new_play 判定触发的 FIFO 清空次数（=流重启次数）
+    // tud_audio_tx_done_isr（mic 方向：每个发出的 ISO IN 包必经；
+    // 以后查 dwc2 ISO IN split 问题就对比这里的设备侧发包数 vs 主机侧收包数）
+    volatile uint32_t tx_pkts;        // 发出的 ISO IN 包数（含 0 长包）
+    volatile uint32_t tx_bytes;       // 累计发出字节
     // 控制面事件（tinyusb 任务上下文）
     volatile uint32_t set_itf;        // Set Interface alt!=0（开流）次数
     volatile uint32_t itf_close;      // Set Interface alt=0（关流）次数

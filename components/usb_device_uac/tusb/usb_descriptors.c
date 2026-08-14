@@ -69,15 +69,16 @@ uint8_t const *tud_descriptor_device_cb(void)
 #define EPNUM_AUDIO_FB    0x81
 #define EPNUM_AUDIO_IN    0x82
 
-// CDC 接口跟在 UAC 后面（spk-only 时 UAC 占 itf 0/1，CDC=2/3）。
-// spk-only 描述符宏不使用 EPNUM_AUDIO_IN(0x82)，故 0x82 给 CDC notify——
-// 与曾经枚举成功的 AS_PART composite 完全相同的端点布局。
+// CDC 接口跟在 UAC 后面（spk+mic 时 UAC 占 itf 0/1/2，CDC=3/4）。
+// mic 启用后 ISO IN 用 0x82，CDC notify 挪到 0x84——ESP32-S3 dwc2 共 5 个
+// IN EP（含 EP0）：0x81 FB / 0x82 mic ISO IN / 0x83 CDC bulk IN / 0x84 notify，
+// 刚好占满。描述符结构变了 → PID 从 0x80C2 挪到 0x80C3（sdkconfig）避开主机缓存。
 enum {
     ITF_NUM_CDC_COMM = ITF_NUM_TOTAL,
     ITF_NUM_CDC_DATA,
     ITF_NUM_TOTAL_COMPOSITE,
 };
-#define EPNUM_CDC_NOTIFY  0x82
+#define EPNUM_CDC_NOTIFY  0x84
 #define EPNUM_CDC_OUT     0x03
 #define EPNUM_CDC_IN      0x83
 // CDC 接口字符串索引 = 现有字符串表末尾（lang/mfr/prod/serial/"usb uac" = 0..4，

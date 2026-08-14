@@ -1,7 +1,7 @@
-// ES8389 codec 初始化（USB UAC 放音路径）
+// ES8389 codec 初始化（USB UAC 放音 + 录音全双工路径）
 // 关键：GPIO47/48 先在 LCD SPI init 阶段当 SPI 用，这里重配成 I2S DOUT/DIN。
-// 音频源是 USB UAC（主机 PCM），不是 MP3 —— 所以本文件只做 codec/I2S 初始化，
-// 不做解码；UAC 收到的 PCM 由 main.c 的 uac_output_cb 写进 codec。
+// 放音：UAC 收到的 PCM 由 main.c 的 uac_output_cb 写进 codec；
+// 录音：main.c 的 uac_input_cb 从 codec 读 PCM（双 MEMS 麦 → ES8389 ADC → I2S rx）。
 #include <stdio.h>
 #include "driver/i2s_std.h"
 #include "esp_codec_dev.h"
@@ -14,13 +14,15 @@
 static const char *TAG = "AUDIO";
 static i2c_master_bus_handle_t s_bus;
 static i2s_chan_handle_t      s_tx;
+static i2s_chan_handle_t      s_rx;
 static esp_codec_dev_handle_t s_codec;
 
 static void i2s_setup(int hz)
 {
+    // 全双工：tx/rx 同一 port（时钟共享，同 48k/16bit/立体声）
     i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan.auto_clear = true;
-    ESP_ERROR_CHECK(i2s_new_channel(&chan, &s_tx, NULL));
+    ESP_ERROR_CHECK(i2s_new_channel(&chan, &s_tx, &s_rx));
     i2s_std_config_t std = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(hz),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
@@ -32,7 +34,9 @@ static void i2s_setup(int hz)
     };
     std.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx, &std));
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_rx, &std));
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx));
+    ESP_ERROR_CHECK(i2s_channel_enable(s_rx));
 }
 
 static void es8389_setup(int hz, int ch, uint8_t es7bit)
@@ -41,7 +45,7 @@ static void es8389_setup(int hz, int ch, uint8_t es7bit)
     audio_codec_i2c_cfg_t ctrl = { .port = 0, .addr = es7bit << 1, .bus_handle = s_bus };
     const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&ctrl);
     assert(ctrl_if);
-    audio_codec_i2s_cfg_t data = { .port = 0, .tx_handle = s_tx, .rx_handle = NULL };
+    audio_codec_i2s_cfg_t data = { .port = 0, .tx_handle = s_tx, .rx_handle = s_rx };
     const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&data);
     assert(data_if);
     const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
@@ -49,7 +53,7 @@ static void es8389_setup(int hz, int ch, uint8_t es7bit)
 
     es8389_codec_cfg_t cfg = {
         .ctrl_if = ctrl_if, .gpio_if = gpio_if,
-        .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
+        .codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH,   // DAC 放音 + ADC 录音（双 MEMS 麦）
         .pa_pin = -1, .pa_reverted = false,
         .master_mode = false,        // ES8389 作 I2S 从
         .use_mclk = false,           // ★ MCLK 未接：codec 从 BCLK 派生内部时钟
@@ -59,7 +63,7 @@ static void es8389_setup(int hz, int ch, uint8_t es7bit)
     };
     const audio_codec_if_t *codec_if = es8389_codec_new(&cfg);
     assert(codec_if);
-    esp_codec_dev_cfg_t dev = { .dev_type = ESP_CODEC_DEV_TYPE_OUT, .codec_if = codec_if, .data_if = data_if };
+    esp_codec_dev_cfg_t dev = { .dev_type = ESP_CODEC_DEV_TYPE_IN_OUT, .codec_if = codec_if, .data_if = data_if };
     s_codec = esp_codec_dev_new(&dev);
     assert(s_codec);
 
@@ -69,7 +73,8 @@ static void es8389_setup(int hz, int ch, uint8_t es7bit)
     };
     ESP_ERROR_CHECK(esp_codec_dev_open(s_codec, &s) == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL);
     esp_codec_dev_set_out_vol(s_codec, 60);
-    ESP_LOGI(TAG, "ES8389 @7bit 0x%02X: %dHz %dch (use_mclk=false, slave, DAC)", es7bit, hz, ch);
+    esp_codec_dev_set_in_gain(s_codec, 30.0);   // 麦克风 PGA 增益（dB，试听后可调）
+    ESP_LOGI(TAG, "ES8389 @7bit 0x%02X: %dHz %dch (use_mclk=false, slave, BOTH DAC+ADC)", es7bit, hz, ch);
 }
 
 void audio_start(i2c_master_bus_handle_t bus)

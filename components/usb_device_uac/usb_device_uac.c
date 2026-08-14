@@ -433,9 +433,13 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
 bool tud_audio_tx_done_isr(uint8_t rhport, uint16_t n_bytes_sent, uint8_t func_id, uint8_t ep_in, uint8_t cur_alt_setting)
 {
     (void)rhport;
-    (void)n_bytes_sent;
     (void)ep_in;
     (void)cur_alt_setting;
+
+    // ---- 调试统计（只做原子自增，见 uac_dbg.h）----
+    g_uac_dbg.tx_pkts++;
+    g_uac_dbg.tx_bytes += n_bytes_sent;
+
     size_t bytes_require = MIC_INTERVAL_MS * s_uac_device->mic_bytes_per_ms;
 
     tu_fifo_t *sw_in_fifo = tud_audio_n_get_ep_in_ff(func_id);

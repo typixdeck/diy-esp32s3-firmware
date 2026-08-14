@@ -82,7 +82,19 @@
 #define PIN_I2S_DIN        48      // U57.36 → ES8389.11 (与 LCD_MOSI 共脚)
 #define PIN_I2S_MCLK       (-1)    // 未接 → use_mclk=false
 
-// USB UAC + CDC composite（AS_PART 模式，描述符在 main/usb_descriptors.c）
+// ===== 麦克风输入（UAC IN 方向）=====
+// 双模拟 MEMS 麦克风 MIC3(左)/MIC4(右)（ZTS6056）→ ES8389 模拟输入：
+//   MIC3 → MIC1（pin24/23，伪差分）→ ADC 左声道（PGA InputSel=DIFF_MIC1P1N）
+//   MIC4 → MIC2（pin22/21，伪差分）→ ADC 右声道（PGA InputSel=DIFF_MIC2N2P）
+// 供电 AUDIO_3V3 由 AW9523 P1_0(DAC_3V3_EN) 控制，main.c 已显式驱高，
+// 麦克风路径无需任何额外 IO 操作。
+// I2S 全双工共用同一 port：DOUT=GPIO47（放音）、DIN=GPIO48（录音），
+// DIN 与 LCD_MOSI 共脚——LCD SPI init 先跑完再起 I2S（时序已在 main.c 保证）。
+#define UAC_MIC_SAMPLE_RATE  48000
+#define UAC_MIC_CHANNELS     2
+#define UAC_MIC_BITS         16
+
+// USB UAC + CDC composite（non-AS_PART：描述符在 components/usb_device_uac/tusb/）
 #define UAC_SAMPLE_RATE    48000
 #define UAC_CHANNELS       2
 #define UAC_BITS           16
