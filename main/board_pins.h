@@ -94,6 +94,12 @@
 #define UAC_MIC_CHANNELS     2
 #define UAC_MIC_BITS         16
 
+// 板 #1（ESP MAC 70:04:1D:D7:E3:40）ES8389 ADC2 模拟前端个体故障：
+// 置 1 使右声道输出左声道数字拷贝（REG0x23 bit4）。
+// 板 #2（70:04:1D:D8:52:70）及正常板必须置 0（真立体声）。
+// 诊断证据链：docs/es8389_adc2_right_channel_dead_2026-08.md
+#define BOARD1_ADC2_DEAD_WORKAROUND  0
+
 // USB UAC + CDC composite（non-AS_PART：描述符在 components/usb_device_uac/tusb/）
 #define UAC_SAMPLE_RATE    48000
 #define UAC_CHANNELS       2

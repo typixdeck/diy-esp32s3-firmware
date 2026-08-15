@@ -68,10 +68,10 @@ static void es8389_setup(int hz, int ch, uint8_t es7bit)
         //   与真实 BCLK=48k×32=1.536MHz 匹配；false 时按 ratio=64（3.072MHz）配置，
         //   与硬件失配（疑似左声道噪音来源之一）。
         .no_dac_ref = true,
-        // ★ 本板 #1 右声道模拟前端（PGA2/MOD2）无输出的 workaround：右=左数字拷贝。
-        //   正常板/换 U12 后改 false 恢复真立体声。诊断见
-        //   docs/es8389_adc2_right_channel_dead_2026-08.md
-        .adc2_copy_left = true,
+        // ★ 板 #1 专用 workaround（右声道模拟前端个体故障，右=左数字拷贝）。
+        //   2026-08-15 板 #2 对比实锤为板 #1 单板问题：板 #2 真立体声正常，
+        //   必须为 false。诊断见 docs/es8389_adc2_right_channel_dead_2026-08.md
+        .adc2_copy_left = BOARD1_ADC2_DEAD_WORKAROUND,
         .mclk_div = 256,
     };
     const audio_codec_if_t *codec_if = es8389_codec_new(&cfg);
