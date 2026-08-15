@@ -15,7 +15,8 @@ static const char *TAG = "AUDIO";
 static i2c_master_bus_handle_t s_bus;
 static i2s_chan_handle_t      s_tx;
 static i2s_chan_handle_t      s_rx;
-static esp_codec_dev_handle_t s_codec;
+static esp_codec_dev_handle_t s_codec_out;
+static esp_codec_dev_handle_t s_codec_in;
 
 static void i2s_setup(int hz)
 {
@@ -59,22 +60,35 @@ static void es8389_setup(int hz, int ch, uint8_t es7bit)
         .use_mclk = false,           // ★ MCLK 未接：codec 从 BCLK 派生内部时钟
         .digital_mic = false, .invert_mclk = false, .invert_sclk = false,
         .hw_gain = { .pa_voltage = 0.0, .codec_dac_voltage = 3.3 },
-        .no_dac_ref = false, .mclk_div = 256,
+        // ★ no_dac_ref 必须为 true（右声道无信号的根因，2026-08-15 实锤）：
+        //   false 时驱动开 "internal reference signal (ADCL + DACR)" AEC 参考模式
+        //   （0x23 bit7 + 0xF0=0x1A）——ADC 数字输出右 slot 被替换成 DAC 回采参考，
+        //   MIC2 信号根本进不了 I2S，用户 Audacity 实录右声道纯噪音即此。
+        //   true 还顺带修正时钟系数：coeff 表选 {32,1536000,48000}（ratio=bits×ch=32），
+        //   与真实 BCLK=48k×32=1.536MHz 匹配；false 时按 ratio=64（3.072MHz）配置，
+        //   与硬件失配（疑似左声道噪音来源之一）。
+        .no_dac_ref = true, .mclk_div = 256,
     };
     const audio_codec_if_t *codec_if = es8389_codec_new(&cfg);
     assert(codec_if);
+
+    // ★ 单个 IN_OUT 设备（回退 2026-08-15 拆分实验）：拆成 OUT/IN 双设备后
+    //   实测 ADC 读出全零（micL=micR=0），且"单设备 DAC 无声"的说法与事实
+    //   矛盾——用户在单设备版本上听到过音乐。保持单设备 + no_dac_ref=true
+    //   （真正的右声道修复）为最小已验证组合。
     esp_codec_dev_cfg_t dev = { .dev_type = ESP_CODEC_DEV_TYPE_IN_OUT, .codec_if = codec_if, .data_if = data_if };
-    s_codec = esp_codec_dev_new(&dev);
-    assert(s_codec);
+    s_codec_out = esp_codec_dev_new(&dev);
+    assert(s_codec_out);
+    s_codec_in = s_codec_out;   // 同一句柄，读写共用
 
     esp_codec_dev_sample_info_t s = {
         .bits_per_sample = 16, .channel = ch, .channel_mask = 0x03,
         .sample_rate = hz, .mclk_multiple = 256,
     };
-    ESP_ERROR_CHECK(esp_codec_dev_open(s_codec, &s) == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL);
-    esp_codec_dev_set_out_vol(s_codec, 60);
-    esp_codec_dev_set_in_gain(s_codec, 30.0);   // 麦克风 PGA 增益（dB，试听后可调）
-    ESP_LOGI(TAG, "ES8389 @7bit 0x%02X: %dHz %dch (use_mclk=false, slave, BOTH DAC+ADC)", es7bit, hz, ch);
+    ESP_ERROR_CHECK(esp_codec_dev_open(s_codec_out, &s) == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL);
+    esp_codec_dev_set_out_vol(s_codec_out, 60);
+    esp_codec_dev_set_in_gain(s_codec_in, 24.0);   // 麦克风 PGA 增益（dB）：30 时用户报噪音偏大，降到 24 观察
+    ESP_LOGI(TAG, "ES8389 @7bit 0x%02X: %dHz %dch (use_mclk=false, slave, IN_OUT single dev, no_dac_ref=1)", es7bit, hz, ch);
 }
 
 void audio_start(i2c_master_bus_handle_t bus)
@@ -94,4 +108,5 @@ void audio_start(i2c_master_bus_handle_t bus)
     es8389_setup(UAC_SAMPLE_RATE, UAC_CHANNELS, es7);
 }
 
-esp_codec_dev_handle_t audio_codec_handle(void) { return s_codec; }
+esp_codec_dev_handle_t audio_codec_handle(void)    { return s_codec_out; }
+esp_codec_dev_handle_t audio_codec_in_handle(void) { return s_codec_in; }

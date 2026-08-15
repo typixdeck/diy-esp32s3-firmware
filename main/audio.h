@@ -6,4 +6,5 @@
 #include "esp_codec_dev.h"
 
 void audio_start(i2c_master_bus_handle_t bus);
-esp_codec_dev_handle_t audio_codec_handle(void);
+esp_codec_dev_handle_t audio_codec_handle(void);      // 放音（OUT）设备：write / 音量 / mute
+esp_codec_dev_handle_t audio_codec_in_handle(void);   // 录音（IN）设备：read / 麦克风增益

@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -522,10 +523,33 @@ static esp_err_t uac_output_cb(uint8_t *buf, size_t len, void *ctx)
 // 组件 usb_mic_task 每 MIC_INTERVAL_MS 调一次：len = 主机要的字节数，
 // esp_codec_dev_read 阻塞到读满（I2S DMA 节奏天然按 48k 走），写 *bytes_read。
 static volatile uint32_t s_mic_calls = 0, s_mic_bytes = 0;
+
+// 双声道 RMS 统计（设备端自证左右声道是否都有数据——区分"codec 没出右声道"
+// 还是"主机侧丢"）。input_cb 跑在 usb_mic_task 任务上下文，可以做整数乘加；
+// 消费方（CDC 统计/HP 抢屏页）读走快照后清零，读撕裂无碍（仅调试仪表）。
+static volatile uint64_t s_mic_sumsq[2] = { 0, 0 };
+static volatile uint32_t s_mic_nsamp = 0;
+
+// 最近 1 秒窗口的双声道 RMS 快照（cdc_stats_task 每秒 take 一次刷新；
+// HP 抢屏页直接读快照，不自己清累计器）
+static volatile float s_mic_rms[2] = { 0, 0 };
+
+// 取两声道 RMS（原始 int16 幅度）并清零累计器，同时刷新全局快照
+static void mic_rms_take(float rms[2])
+{
+    uint64_t sl = s_mic_sumsq[0], sr = s_mic_sumsq[1];
+    uint32_t n = s_mic_nsamp;
+    s_mic_sumsq[0] = 0; s_mic_sumsq[1] = 0; s_mic_nsamp = 0;
+    rms[0] = n ? sqrtf((float)(sl / n)) : 0;
+    rms[1] = n ? sqrtf((float)(sr / n)) : 0;
+    s_mic_rms[0] = rms[0];
+    s_mic_rms[1] = rms[1];
+}
+
 static esp_err_t uac_input_cb(uint8_t *buf, size_t len, size_t *bytes_read, void *ctx)
 {
     (void)ctx;
-    esp_codec_dev_handle_t codec = audio_codec_handle();
+    esp_codec_dev_handle_t codec = audio_codec_in_handle();
     if (!codec) {
         memset(buf, 0, len);
         *bytes_read = len;
@@ -538,6 +562,18 @@ static esp_err_t uac_input_cb(uint8_t *buf, size_t len, size_t *bytes_read, void
     if (ret != ESP_CODEC_DEV_OK) {
         memset(buf, 0, len);   // 读失败发静音，不断流
     }
+    // 奇偶采样分离统计（interleaved L/R int16）
+    const int16_t *pcm = (const int16_t *)buf;
+    size_t frames = len / 4;   // 2ch × 2B
+    uint64_t sl = 0, sr = 0;
+    for (size_t i = 0; i < frames; i++) {
+        int32_t l = pcm[2 * i], r = pcm[2 * i + 1];
+        sl += (uint64_t)(l * l);
+        sr += (uint64_t)(r * r);
+    }
+    s_mic_sumsq[0] += sl;
+    s_mic_sumsq[1] += sr;
+    s_mic_nsamp += frames;
     *bytes_read = len;
     s_mic_calls++;
     s_mic_bytes += len;
@@ -563,6 +599,14 @@ static void uac_set_volume_cb(uint32_t volume, void *ctx)
 static volatile bool s_reboot_to_boot = false;   // rx_cb 置位，stats 任务执行
 static volatile bool s_audio_dump = false;       // AUDIO_DUMP：打印功放/耳机/ES8389 寄存器
 static volatile int  s_amp_force = 0;            // AMP_ON=1 / AMP_OFF=-1（诊断用，stats 任务消费后清零）
+
+// HP_DET 插拔事件（hp_amp_task 生产，两处消费）：
+//   - cdc_stats_task 打印 "HP_DET changed: x->y"（s_hp_cdc_event 消费后清零）；
+//   - app_main 主循环抢屏 2 秒（s_hp_grab_event 消费后清零）。
+// raw 电平不预设极性（bit7 原始值 0/1），极性猜测只做展示标注"待确认"。
+static volatile int      s_hp_cdc_event = 0;     // 0=无, 1=raw 0->1, 2=raw 1->0
+static volatile int      s_hp_grab_event = 0;    // 同上（独立消费，互不干扰）
+static volatile uint32_t s_hp_event_ms = 0;      // 事件时间戳（tick ms）
 
 // tinyusb 任务上下文：只收集行、置标志，不调任何 CDC 写 API
 void tud_cdc_rx_cb(uint8_t itf)
@@ -635,9 +679,11 @@ static void cdc_stats_task(void *arg)
     uint32_t tick = 0;
     bool greeted = false;
 
+    float rms[2];
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         tick++;
+        mic_rms_take(rms);   // 每秒必取（同时刷新 s_mic_rms 供 HP 抢屏页用）
 
         if (s_reboot_to_boot) {
             if (tud_cdc_connected()) {
@@ -670,6 +716,15 @@ static void cdc_stats_task(void *arg)
             s_audio_dump = false;
             cdc_audio_dump();
         }
+        if (s_hp_cdc_event) {
+            int ev = s_hp_cdc_event;
+            s_hp_cdc_event = 0;
+            char m[80];
+            int k = snprintf(m, sizeof(m), "\r\n>>> HP_DET changed: %s @%lums (raw bit7)\r\n",
+                             ev == 1 ? "0->1" : "1->0", (unsigned long)s_hp_event_ms);
+            tud_cdc_write(m, (uint32_t)k);
+            tud_cdc_write_flush();
+        }
         if (!greeted) {
             greeted = true;
             const char *hello = "\r\n=== TypixDeck UAC+CDC stats (1Hz) ===\r\n"
@@ -684,8 +739,8 @@ static void cdc_stats_task(void *arg)
         uint32_t mcalls = s_mic_calls;
         int n = snprintf(buf, sizeof(buf),
             "[%lu] rx=%lu pkt/s %lu B/s sz=%lu..%lu gap>1.5ms=%lu maxgap=%luus "
-            "clr=%lu | cb=%lu/s | tx=%lu pkt/s %lu B/s mic_cb=%lu/s | "
-            "itf open=%lu close=%lu mnt=%lu sus=%lu\r\n",
+            "clr=%lu | cb=%lu/s | tx=%lu pkt/s %lu B/s mic_cb=%lu/s "
+            "micL=%.0f micR=%.0f | itf open=%lu close=%lu mnt=%lu sus=%lu\r\n",
             (unsigned long)tick,
             (unsigned long)(cur.rx_pkts - prev.rx_pkts),
             (unsigned long)(cur.rx_bytes - prev.rx_bytes),
@@ -698,6 +753,7 @@ static void cdc_stats_task(void *arg)
             (unsigned long)(cur.tx_pkts - prev.tx_pkts),
             (unsigned long)(cur.tx_bytes - prev.tx_bytes),
             (unsigned long)(mcalls - prev_mic_calls),
+            rms[0], rms[1],
             (unsigned long)cur.set_itf,
             (unsigned long)cur.itf_close,
             (unsigned long)cur.mount,
@@ -758,29 +814,81 @@ static void amp_power(bool on)
     ESP_LOGI(TAG, "功放 %s", on ? "开" : "关");
 }
 
-static bool headphone_plugged(void)
+// HP_DET(P1_7) 原始电平（1=上拉态/0=对地）——极性未实测，报告用 raw 值
+static int hp_det_raw(void)
 {
     uint8_t in = 0;
     aw9523_read_reg(s_aw9523, AW9523_REG_INPUT_P1, &in);
-    return (in & AW9523_P1_HP_DET) == 0;   // LOW = 插了
+    return (in & AW9523_P1_HP_DET) ? 1 : 0;
+}
+
+static bool headphone_plugged(void)
+{
+    return hp_det_raw() == 0;   // 假设 LOW = 插了（R166 上拉，插入接地）——待实测确认
 }
 
 static void hp_amp_task(void *arg)
 {
-    bool plugged = headphone_plugged();
-    amp_power(!plugged);                    // 开机按当前状态设一次
-    ESP_LOGI(TAG, "耳机检测启动：%s", plugged ? "已插→功放关" : "未插→功放开");
+    (void)arg;
+    int raw = hp_det_raw();
+    amp_power(raw != 0);                    // 开机按当前状态设一次（raw=1 假设未插→功放开）
+    ESP_LOGI(TAG, "耳机检测启动：HP_DET raw=%d（%s，极性待实测）", raw,
+             raw ? "假设未插→功放开" : "假设已插→功放关");
     while (1) {
-        bool now = headphone_plugged();
-        if (now != plugged) {
-            vTaskDelay(pdMS_TO_TICKS(50));   // 二次确认去抖
-            if (headphone_plugged() == now) {
-                plugged = now;
-                amp_power(!plugged);         // 插→关；拔→开
+        int now = hp_det_raw();
+        if (now != raw) {
+            vTaskDelay(pdMS_TO_TICKS(50));   // 二次采样一致才算数（去抖）
+            if (hp_det_raw() == now) {
+                int ev = now ? 1 : 2;        // 1: 0->1, 2: 1->0
+                raw = now;
+                amp_power(raw != 0);         // 假设极性：raw=0 插→关功放
+                s_hp_event_ms = (uint32_t)((int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS);
+                s_hp_cdc_event  = ev;
+                s_hp_grab_event = ev;
+                ESP_LOGI(TAG, "HP_DET changed -> raw=%d", raw);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(200));      // 5Hz 轮询
+        vTaskDelay(pdMS_TO_TICKS(100));      // 10Hz 轮询
     }
+}
+
+// ---------------------------------------------------------------------------
+// HP_DET 抢屏页：大字 raw 电平 + 插拔猜测（待确认）+ 双声道 RMS 仪表
+// ---------------------------------------------------------------------------
+static void ui_draw_hp_page(int raw)
+{
+    char buf[64];
+    fb_fill_rect(0, 0, LCD_H_RES, LCD_V_RES, C_DARK);
+    fb_fill_rect(0, 0, LCD_H_RES, 110, C_NAVY);
+    fb_fill_rect(0, 110, LCD_H_RES, 4, C_CYAN);
+    fb_draw_text_centered(30, "HEADPHONE EVENT", 5, C_WHITE);
+
+    snprintf(buf, sizeof(buf), "HP-DET=%d", raw);
+    fb_draw_text_centered(180, buf, 14, raw ? C_GREEN : C_YELL);
+
+    // 极性猜测：R166 上拉到 AUDIO_3V3，假设插入接地 → LOW=插入（待实测确认）
+    fb_draw_text_centered(340, raw ? "GUESS: UNPLUGGED" : "GUESS: PLUGGED", 6, C_LGRAY);
+    fb_draw_text_centered(410, "POLARITY UNCONFIRMED", 3, C_GRAY);
+
+    // 双声道 RMS 仪表（最近 1 秒窗口，主机在录音时才有数据流）
+    float l = s_mic_rms[0], r = s_mic_rms[1];
+    snprintf(buf, sizeof(buf), "MIC RMS L:%5.0f R:%5.0f", l, r);
+    fb_draw_text_centered(500, buf, 5, C_CYAN);
+    // 简易电平条（满量程按 4000 归一，方便看语音级信号）
+    int bw = 700, bh = 36, bx = (LCD_H_RES - bw) / 2;
+    for (int ch = 0; ch < 2; ch++) {
+        int by = 580 + ch * 60;
+        float v = ch == 0 ? l : r;
+        int fill = (int)(v / 4000.0f * bw);
+        if (fill > bw) fill = bw;
+        fb_fill_rect(bx - 3, by - 3, bw + 6, bh + 6, C_LGRAY);
+        fb_fill_rect(bx, by, bw, bh, C_BLACK);
+        if (fill > 0) fb_fill_rect(bx, by, fill, bh, ch == 0 ? C_GREEN : C_CYAN);
+        fb_draw_text(bx - 40, by + 6, ch == 0 ? "L" : "R", 3, C_WHITE);
+    }
+
+    fb_draw_text_centered(725, "BACK TO PI IN 2S", 3, C_YELL);
+    esp_lcd_panel_draw_bitmap(s_panel, 0, 0, LCD_H_RES, LCD_V_RES, s_fb);
 }
 
 void app_main(void)
@@ -836,6 +944,7 @@ void app_main(void)
 
     int prev_lvl = 1;
     int64_t last_draw_ms = 0;
+    int64_t hp_grab_until_ms = 0;   // >now 表示 HP_DET 抢屏窗口生效中
     while (1) {
         int lvl = gpio_get_level(PIN_BOOT_BTN);
         int64_t now_ms = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -843,6 +952,7 @@ void app_main(void)
         if (prev_lvl == 1 && lvl == 0) {          // 按下沿（50ms 轮询自带消抖）
             esp_owns = !esp_owns;
             ESP_LOGI(TAG, "SW3 按下 → 屏幕切到 %s", esp_owns ? "ESP" : "Pi");
+            hp_grab_until_ms = 0;                  // 手动切换优先，取消抢屏窗口
             if (esp_owns) {
                 ui_draw_telemetry(now_ms / 1000);  // 先备好画面再切 MUX
                 last_draw_ms = now_ms;
@@ -852,6 +962,31 @@ void app_main(void)
             }
         }
         prev_lvl = lvl;
+
+        // HP_DET 插拔事件 → ESP 抢屏 2 秒显示状态页，到时切回原归属
+        if (s_hp_grab_event) {
+            int ev = s_hp_grab_event;
+            s_hp_grab_event = 0;
+            ui_draw_hp_page(ev == 1 ? 1 : 0);      // 先备好画面再切 MUX
+            if (mux_select(true) == ESP_OK) {
+                hp_grab_until_ms = now_ms + 2000;
+            }
+        }
+        if (hp_grab_until_ms) {
+            if (now_ms >= hp_grab_until_ms) {
+                hp_grab_until_ms = 0;
+                if (mux_select(esp_owns) != ESP_OK) {  // 恢复 SW3 决定的归属
+                    ESP_LOGE(TAG, "MUX 恢复失败");
+                }
+                if (esp_owns) {
+                    ui_draw_telemetry(now_ms / 1000);
+                    last_draw_ms = now_ms;
+                }
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(50));     // 抢屏窗口内不跑遥测重绘
+                continue;
+            }
+        }
 
         if (esp_owns && now_ms - last_draw_ms >= 500) {
             ui_draw_telemetry(now_ms / 1000);
