@@ -29,6 +29,7 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_rgb.h"
 #include "driver/i2c_master.h"
+#include "driver/ledc.h"
 
 #include "board_pins.h"
 #include "aw9523.h"
@@ -209,6 +210,27 @@ static esp_err_t cw2015_read(i2c_master_dev_handle_t dev, float *v, int *soc)
 
 // STC3117 电量计 @0x70（⚠️ 在 MUX U71 后面，仅 MUX=ESP 侧时可达——
 // 遥测页恰好只在 ESP 持屏时刷新，天然满足）：V LSB 2.20mV，SOC LSB 1/512%
+//
+// ⚠️ POR 后芯片处于 standby（MODE.GG_RUN=0），电压/SOC 寄存器冻结在初次
+// 转换值（实测恒显 4.037V/85.4% 的根因，2026-08-15）。必须置 GG_RUN=1
+// 才持续转换。CC_CNF/VM_CNF 精确标定交给 Pi 内核驱动（stc3117_fuel_gauge，
+// 见 docs/pi_battery_gauge_gui_research_2026-08.md）；ESP 只确保芯片在跑，
+// 写入幂等，与 Pi 驱动不冲突。
+#define STC3117_REG_MODE   0x00
+#define STC3117_GG_RUN     (1 << 4)   // 1=运行；bit0 VMODE=0 混合模式（带库仑计）
+
+static void stc3117_ensure_running(i2c_master_dev_handle_t dev)
+{
+    uint8_t mode = 0;
+    if (!dev || reg8_read(dev, STC3117_REG_MODE, &mode, 1) != ESP_OK) return;
+    if (!(mode & STC3117_GG_RUN)) {
+        uint8_t cmd[2] = { STC3117_REG_MODE, (uint8_t)(mode | STC3117_GG_RUN) };
+        if (i2c_master_transmit(dev, cmd, 2, 100) == ESP_OK) {
+            ESP_LOGI(TAG, "STC3117 原为 standby（读数冻结），已置 GG_RUN 启动连续转换");
+        }
+    }
+}
+
 static esp_err_t stc3117_read(i2c_master_dev_handle_t dev, float *v, float *soc)
 {
     uint8_t b[2];
@@ -247,6 +269,9 @@ static void sensors_start(void)
         uint8_t wake[2] = { 0x0A, 0x00 };
         i2c_master_transmit(s_cw2015, wake, 2, 100);
     }
+    // 开机 GT911 复位窗口期间 MUX 在 ESP 侧，顺手启动 STC3117；
+    // 若此刻 MUX 已归还 Pi 侧则静默失败，由遥测页刷新时兜底重试
+    stc3117_ensure_running(s_stc3117);
 }
 
 // 板上 I2C 器件在位探测（名字 + 主/备地址；0 表示无备用地址）
@@ -261,6 +286,7 @@ static const sensor_desc_t k_sensors[] = {
     { "RX8130",  0x32, 0    },  // U59 RTC
     { "ES8389",  0x10, 0x11 },  // U12 Codec
     { "GT911",   0x5D, 0x14 },  // 触摸（MUX 后）
+    { "KBD6R11", 0x1F, 0    },  // U32 键盘 STM32（QMK I2C 从机）
 };
 #define N_SENSORS (sizeof(k_sensors) / sizeof(k_sensors[0]))
 
@@ -284,6 +310,7 @@ static void ui_draw_telemetry(uint32_t uptime_s)
     bool vbat_ok = s_ina_vbat && ina219_read(s_ina_vbat, &vbat_v, &vbat_a) == ESP_OK;
     bool vbus_ok = s_ina_vbus && ina219_read(s_ina_vbus, &vbus_v, &vbus_a) == ESP_OK;
     if (!s_cw2015 || cw2015_read(s_cw2015, &cw_v, &cw_soc) != ESP_OK) cw_soc = -1;
+    stc3117_ensure_running(s_stc3117);   // 兜底：POR/BATFAIL 后重新拉起 GG_RUN
     if (!s_stc3117 || stc3117_read(s_stc3117, &stc_v, &stc_soc) != ESP_OK) stc_soc = -1;
 
     fb_fill_rect(0, 0, LCD_H_RES, LCD_V_RES, C_DARK);
@@ -371,7 +398,7 @@ static void ui_draw_telemetry(uint32_t uptime_s)
     }
 
     // ---- 底部 ----
-    snprintf(buf, sizeof(buf), "UPTIME %lu S   PRESS SW3 - BACK TO PI",
+    snprintf(buf, sizeof(buf), "UPTIME %lu S   SW3 OR SQUARE KEY - BACK TO PI",
              (unsigned long)uptime_s);
     fb_draw_text_centered(725, buf, 3, C_YELL);
 
@@ -461,14 +488,55 @@ static esp_err_t rgb_panel_start(void)
     return ESP_OK;
 }
 
+// LCD 背光：U55 SY7201ABC 升压驱动，EN 脚 PWM 调光（GPIO21 → U70 MUX →
+// LCD_BL）。⚠️ 这条线走 MUX：ESP 持屏时才由本 PWM 控制，Pi 持屏时由
+// Pi GPIO18 硬件 PWM 控制（两侧各自记档位）。10kHz 在 SY7201 EN 调光
+// 频率范围内，且档位 1（10%）的低电平脉宽 90µs 远小于关断阈值 ~2.5ms。
+#define BL_LEVELS        10
+#define BL_LEDC_TIMER    LEDC_TIMER_0
+#define BL_LEDC_CHANNEL  LEDC_CHANNEL_0
+
+static volatile int s_bl_level = BL_LEVELS;   // 1..10，默认最亮
+
+static void backlight_apply(void)
+{
+    uint32_t duty = (uint32_t)s_bl_level * ((1 << 10) - 1) / BL_LEVELS;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL);
+}
+
 static void backlight_on(void)
 {
-    gpio_config_t bl_cfg = {
-        .pin_bit_mask = 1ULL << PIN_LCD_BL,
-        .mode = GPIO_MODE_OUTPUT,
+    ledc_timer_config_t tcfg = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .timer_num = BL_LEDC_TIMER,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .freq_hz = 10000,
+        .clk_cfg = LEDC_AUTO_CLK,
     };
-    gpio_config(&bl_cfg);
-    gpio_set_level(PIN_LCD_BL, 1);
+    ledc_timer_config(&tcfg);
+    ledc_channel_config_t ccfg = {
+        .gpio_num = PIN_LCD_BL,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = BL_LEDC_CHANNEL,
+        .timer_sel = BL_LEDC_TIMER,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ledc_channel_config(&ccfg);
+    backlight_apply();
+}
+
+// ◯/✤ 键：亮度加/减一档（1..BL_LEVELS 饱和，与 Pi 侧标准亮度键行为一致），
+// 返回新档位
+static int backlight_adjust(int dir)
+{
+    int lv = s_bl_level + dir;
+    if (lv < 1) lv = 1;
+    if (lv > BL_LEVELS) lv = BL_LEVELS;
+    s_bl_level = lv;
+    backlight_apply();
+    return s_bl_level;
 }
 
 static void boot_btn_start(void)
@@ -488,6 +556,105 @@ static esp_err_t mux_select(bool esp_side)
     return aw9523_update_bits(s_aw9523, AW9523_REG_OUTPUT_P0,
                               AW9523_P0_MUX_SEL,
                               esp_side ? AW9523_P0_MUX_SEL : 0);
+}
+
+// ---------------------------------------------------------------------------
+// KeebDeck 键盘 I2C 从机（U32 STM32F042 QMK @0x1F，实现见
+// firmware/keebdeck_6r11c/i2c_slave_kbd.c）：
+//   reg 0x00=ID(0x6B)  reg 0x01=FIFO 计数  reg 0x02=弹出事件（连续读连续弹）
+//   事件字节：bit7=按下, bit6:4=行, bit3:0=列；0x00=FIFO 空
+// 键盘常供电、SCL/SDA 恒挂 ESP 总线（不走 MUX），Pi 持屏期间照样收键。
+// □ 键 =(0,1)：按下请求切屏（Pi ↔ ESP 遥测页），与 SW3 等价。
+// ---------------------------------------------------------------------------
+#define KBD_I2C_ADDR       0x1F
+#define KBD_REG_FIFO_COUNT 0x01
+#define KBD_REG_FIFO_POP   0x02
+
+static i2c_master_dev_handle_t s_kbd;
+static volatile bool s_kbd_toggle_req = false;
+
+// 键盘事件回显文本：kbd_task 生产，cdc_stats_task 每秒冲刷到 CDC
+//（遵守并发纪律：tud_cdc_write 只出现在 cdc_stats_task）
+static char s_kbd_log[256];
+static size_t s_kbd_log_len = 0;
+static portMUX_TYPE s_kbd_log_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void kbd_log_append(const char *s)
+{
+    size_t n = strlen(s);
+    portENTER_CRITICAL(&s_kbd_log_mux);
+    if (s_kbd_log_len + n < sizeof(s_kbd_log)) {
+        memcpy(s_kbd_log + s_kbd_log_len, s, n);
+        s_kbd_log_len += n;
+    }
+    portEXIT_CRITICAL(&s_kbd_log_mux);
+}
+
+// cdc_stats_task 专用：取走并清空回显缓冲，返回取到的字节数
+static size_t kbd_log_take(char *dst, size_t cap)
+{
+    portENTER_CRITICAL(&s_kbd_log_mux);
+    size_t n = s_kbd_log_len < cap ? s_kbd_log_len : cap;
+    memcpy(dst, s_kbd_log, n);
+    s_kbd_log_len = 0;
+    portEXIT_CRITICAL(&s_kbd_log_mux);
+    return n;
+}
+
+static void kbd_task(void *arg)
+{
+    (void)arg;
+    bool online = false;
+    while (1) {
+        uint8_t reg = KBD_REG_FIFO_COUNT;
+        uint8_t cnt = 0;
+        esp_err_t err = i2c_master_transmit_receive(s_kbd, &reg, 1, &cnt, 1, 50);
+        if (err != ESP_OK) {
+            if (online) {
+                online = false;
+                ESP_LOGW(TAG, "键盘 I2C 掉线");
+                kbd_log_append("[KBD offline]\r\n");
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));   // 离线（如键盘在 DFU）降频重试
+            continue;
+        }
+        if (!online) {
+            online = true;
+            ESP_LOGI(TAG, "键盘 I2C 在线 @0x%02X", KBD_I2C_ADDR);
+            kbd_log_append("[KBD online]\r\n");
+        }
+        if (cnt > 0) {
+            uint8_t ev[16];
+            if (cnt > sizeof(ev)) cnt = sizeof(ev);
+            reg = KBD_REG_FIFO_POP;
+            if (i2c_master_transmit_receive(s_kbd, &reg, 1, ev, cnt, 50) == ESP_OK) {
+                for (int i = 0; i < cnt; i++) {
+                    if (ev[i] == 0x00) continue;   // 竞态下 FIFO 提前抽干
+                    bool pressed = ev[i] & 0x80;
+                    int row = (ev[i] >> 4) & 0x07;
+                    int col = ev[i] & 0x0F;
+                    char line[32];
+                    snprintf(line, sizeof(line), "KEY r%d c%d %s\r\n",
+                             row, col, pressed ? "DOWN" : "UP");
+                    kbd_log_append(line);
+                    ESP_LOGI(TAG, "键盘事件 r%d c%d %s", row, col, pressed ? "按下" : "抬起");
+                    if (pressed && row == 0 && col == 1) {
+                        s_kbd_toggle_req = true;   // □ 键 → 切屏
+                    }
+                    if (pressed && row == 0 && (col == 7 || col == 8)) {
+                        // ◯ (0,7)=亮一档 / ✤ (0,8)=暗一档 → ESP 侧 GPIO21
+                        // LEDC（仅 ESP 持屏时背光归 ESP；Pi 持屏时同两键发
+                        // 标准亮度键码，由 Pi 调自己的 GPIO18 PWM）
+                        int lv = backlight_adjust(col == 7 ? +1 : -1);
+                        ESP_LOGI(TAG, "背光档位 → %d/%d", lv, BL_LEVELS);
+                        snprintf(line, sizeof(line), "[BL %d/%d]\r\n", lv, BL_LEVELS);
+                        kbd_log_append(line);
+                    }
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -725,6 +892,14 @@ static void cdc_stats_task(void *arg)
             tud_cdc_write(m, (uint32_t)k);
             tud_cdc_write_flush();
         }
+        {
+            char klog[256];
+            size_t kn = kbd_log_take(klog, sizeof(klog));
+            if (kn) {
+                tud_cdc_write(klog, (uint32_t)kn);
+                tud_cdc_write_flush();
+            }
+        }
         if (!greeted) {
             greeted = true;
             const char *hello = "\r\n=== TypixDeck UAC+CDC stats (1Hz) ===\r\n"
@@ -938,9 +1113,15 @@ void app_main(void)
     if (mux_select(false) != ESP_OK) {
         ESP_LOGE(TAG, "MUX 切 Pi 失败");
     }
-    ESP_LOGI(TAG, "初始化完成：MUX=Pi 侧，按 SW3(BOOT) 切换 ESP 遥测页");
+    ESP_LOGI(TAG, "初始化完成：MUX=Pi 侧，按 SW3(BOOT) 或键盘 □ 键切换 ESP 遥测页");
 
     boot_btn_start();
+
+    // 键盘 I2C 从机：加设备 + 事件轮询任务（□ 键按下置 s_kbd_toggle_req）
+    s_kbd = sensor_add(KBD_I2C_ADDR);
+    if (s_kbd) {
+        xTaskCreate(kbd_task, "kbd", 4096, NULL, 5, NULL);
+    }
 
     int prev_lvl = 1;
     int64_t last_draw_ms = 0;
@@ -949,9 +1130,14 @@ void app_main(void)
         int lvl = gpio_get_level(PIN_BOOT_BTN);
         int64_t now_ms = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-        if (prev_lvl == 1 && lvl == 0) {          // 按下沿（50ms 轮询自带消抖）
+        bool toggle = (prev_lvl == 1 && lvl == 0);   // SW3 按下沿（50ms 轮询自带消抖）
+        if (s_kbd_toggle_req) {
+            s_kbd_toggle_req = false;
+            toggle = true;                            // 键盘 □ 键，与 SW3 等价
+        }
+        if (toggle) {
             esp_owns = !esp_owns;
-            ESP_LOGI(TAG, "SW3 按下 → 屏幕切到 %s", esp_owns ? "ESP" : "Pi");
+            ESP_LOGI(TAG, "切屏请求 → 屏幕切到 %s", esp_owns ? "ESP" : "Pi");
             hp_grab_until_ms = 0;                  // 手动切换优先，取消抢屏窗口
             if (esp_owns) {
                 ui_draw_telemetry(now_ms / 1000);  // 先备好画面再切 MUX
