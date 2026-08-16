@@ -38,7 +38,9 @@
 #define AW9523_P0_SAFE_SHDN   (1 << 4)  // P0_4 (pin10) → R69 → Pi GPIO26（关机通知信号）【输入】
 #define AW9523_P0_SAFE_PWROFF (1 << 5)  // P0_5 (pin11) → R70 → Pi GPIO19（掉电通知信号）【输入】
 #define AW9523_P0_GAUGE_ALM   (1 << 6)  // P0_6 (pin12) ← 电量计告警（R88 上拉）【输入】
-#define AW9523_P0_PI_GPIO2    (1 << 7)  // P0_7 (pin13) → R83 → Pi GPIO2/SDA1（触摸 SDA 的 Pi 侧！）【输入】
+#define AW9523_P0_PI_GPIO2    (1 << 7)  // P0_7 (pin13) → R83(0Ω) → Pi GPIO2 = DPI VSYNC（网表：GPIO2=CN1.58+R83.2+U63.9；
+                                        //   曾误标"触摸 SDA"——触摸 SDA 的 Pi 侧是 GPIO10→U71.1。
+                                        //   vsync_mon 用它的输入中断探测 Pi 刷屏/测 FPS）【输入】
 // ---- P1 ----
 #define AW9523_P1_DAC_3V3_EN  (1 << 0)  // P1_0 (pin1)  → U31.3 DAC 电源（R84 上拉=默认开）【输入】
 #define AW9523_P1_LCD_RST     (1 << 1)  // P1_1 (pin2)  → R185 → LCD_RST（R101 上拉）【输出】
@@ -50,6 +52,12 @@
 #define AW9523_P1_HP_DET      (1 << 7)  // P1_7 (pin17) → R86 → HP_DET 耳机检测(CN10.1)【输入】
 
 esp_err_t aw9523_init(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t *out_dev);
+// 运行期自愈重建：芯片被 ESD/毛刺复位（寄存器回默认全输出高）后，按 aw9523_init
+// 同款绝对写入序列重建配置，并把 MUX 恢复到 mux_esp_side。
+// 与 init 的差异：INT_P0 保留 P0_7(VSYNC) 使能——调用时 vsync_mon 已在跑。
+esp_err_t aw9523_reinit(i2c_master_dev_handle_t dev, bool mux_esp_side);
+// 当前时点 INT_P0 应有值：vsync 探测锁定前 0x7F（P0_7 使能），锁定后 0xFF 全屏蔽
+uint8_t aw9523_int_p0_expected(void);
 // GT911 规范复位（INT 拉低贯穿 → 地址 0x5D，固件干净启动），调用后再 gt911_init
 esp_err_t aw9523_gt911_reset(i2c_master_dev_handle_t dev);
 esp_err_t aw9523_read_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *val);

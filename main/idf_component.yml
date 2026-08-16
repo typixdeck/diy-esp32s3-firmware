@@ -1,4 +1,6 @@
 ## IDF Component Manager Manifest File
 dependencies:
-  idf: ">=5.4"
-  espressif/esp_codec_dev: "^1.3.4"
+  idf: '>=5.4'
+  espressif/esp_codec_dev: ^1.3.4
+  # TTF 矢量字体渲染（阿里普惠体子集放 font 分区，mmap 后 FreeType 直读）
+  espressif/freetype: ^2.14.3

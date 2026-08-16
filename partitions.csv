@@ -1,0 +1,9 @@
+# TypixDeck 0720 自定义分区表（8MB flash）：
+# factory 2MB（app 实际 ~0.5MB，留余量）；font 分区 4MB 放阿里巴巴普惠体
+# TTF 子集（ASCII+GB2312，~3.5MB），运行时 esp_partition_mmap 零拷贝映射，
+# FreeType 直接从映射内存读字形。刷字体：esptool write_flash 0x210000 font.ttf
+# Name,    Type, SubType, Offset,   Size
+nvs,       data, nvs,     0x9000,   0x6000
+phy_init,  data, phy,     0xf000,   0x1000
+factory,   app,  factory, 0x10000,  0x200000
+font,      data, spiffs,  0x210000, 0x400000

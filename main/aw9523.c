@@ -4,8 +4,16 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "board_pins.h"
+#include "vsync_mon.h"
 
 static const char *TAG = "AW9523";
+
+// INTN 与 LCD CS 共线（R82）：vsync 探测锁定后 INT 必须全屏蔽，
+// 任何"重开 P0_7"的路径（reinit/健康检查）都以此为唯一事实来源。
+uint8_t aw9523_int_p0_expected(void)
+{
+    return vsync_mon_locked() ? 0xFF : (uint8_t)(0xFF & ~AW9523_P0_PI_GPIO2);
+}
 
 esp_err_t aw9523_read_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *val)
 {
@@ -107,6 +115,33 @@ esp_err_t aw9523_init(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t *out_
                   "LCD_RST(P1_1)=1, TP_RST(P1_4)=1, 其余 13 脚全输入 Hi-Z");
 
     *out_dev = dev;
+    return ESP_OK;
+}
+
+// 运行期自愈重建（2026-08-16 实翻车：碰外壳静电把 AW9523 打回默认态/挂总线，
+// MUX 卡 ESP 侧回不去 Pi）。序列与 aw9523_init 相同：先 CONFIG 释放 13 个
+// 输入脚（复位后全输出高，输入态释放无毛刺），再 GCR 推挽，最后 OUTPUT。
+// INT_P0：vsync_mon 未锁定时保留 P0_7 使能（探测还在跑）；已锁定（Pi 出图
+// 确认、探测永久关闭）则全屏蔽——INTN 与 LCD CS 共线，重开 P0_7 等于把
+// I2S 音频码流当 SPI 灌进面板（2026-08-16 实翻车：运行中随机反色）。
+esp_err_t aw9523_reinit(i2c_master_dev_handle_t dev, bool mux_esp_side)
+{
+    esp_err_t err;
+    if ((err = aw9523_write_reg(dev, AW9523_REG_INT_P0,
+                                aw9523_int_p0_expected())) != ESP_OK) return err;
+    if ((err = aw9523_write_reg(dev, AW9523_REG_INT_P1, 0xFF)) != ESP_OK) return err;
+    if ((err = aw9523_write_reg(dev, AW9523_REG_LEDMODE_P0, 0xFF)) != ESP_OK) return err;
+    if ((err = aw9523_write_reg(dev, AW9523_REG_LEDMODE_P1, 0xFF)) != ESP_OK) return err;
+    if ((err = aw9523_write_reg(dev, AW9523_REG_CONFIG_P0,
+                                0xFF & ~AW9523_P0_MUX_SEL)) != ESP_OK) return err;
+    if ((err = aw9523_write_reg(dev, AW9523_REG_CONFIG_P1,
+                                0xFF & ~(AW9523_P1_LCD_RST | AW9523_P1_TP_RST))) != ESP_OK) return err;
+    if ((err = aw9523_update_bits(dev, AW9523_REG_GCR, 1 << 4, 1 << 4)) != ESP_OK) return err;
+    if ((err = aw9523_write_reg(dev, AW9523_REG_OUTPUT_P0,
+                                mux_esp_side ? AW9523_P0_MUX_SEL : 0)) != ESP_OK) return err;
+    if ((err = aw9523_write_reg(dev, AW9523_REG_OUTPUT_P1,
+                                AW9523_P1_LCD_RST | AW9523_P1_TP_RST)) != ESP_OK) return err;
+    ESP_LOGW(TAG, "AW9523 配置已重建（MUX=%s 侧）", mux_esp_side ? "ESP" : "Pi");
     return ESP_OK;
 }
 

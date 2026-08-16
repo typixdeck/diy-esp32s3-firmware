@@ -1,17 +1,17 @@
-// TypixDeck 0720 — ESP32-S3 / Pi 双源显示切换器 + 电源监视器
+// TypixDeck 0720 — ESP32-S3 / Pi 双源显示切换器 + 电源监视器 + 本地 GUI
 //
 // 上电即并行启动（不再抑制 CM）：
 //   - CM_PMIC_EN(P0_2) 保持输入 Hi-Z，R79 上拉 = CM 上电自启；
 //   - AW9523 只驱动 3 根线：MUX_SEL / LCD_RST / TP_RST，其余 13 脚输入 Hi-Z
 //     （严禁全端口驱高：背馈未上电 CM，CLAUDE.md 踩坑 #15）；
-//   - 开机 MUX 短暂切 ESP 侧：JD9168S SPI 初始化 + GT911 INT-low 复位
-//     （Pi 出图/goodix probe 在数秒后，这个窗口 Pi 无感知）；
-//   - 完成后 MUX_SEL=0 交给 Pi，ESP 的 RGB 输出照常扫描（被 MUX 隔离，不冲突）。
+//   - 开机 MUX 保持 ESP 侧：JD9168S SPI 初始化 + GT911 INT-low 复位 +
+//     GT911 触摸初始化，然后播放开机动画（TYPIXDECK + 旋转 spinner）；
+//   - VSYNC 探测（vsync_mon）：Pi GPIO2(DPI VSYNC)→R83→AW9523 P0_7 中断→
+//     INTN→GPIO5。一旦探测到稳定信号立即切 MUX 交给 Pi，不再自动切回。
 //
-// SW3（ESP BOOT 键，GPIO0）：启动后不再是 strap，当普通按钮轮询。
-//   每按一次 toggle MUX_SEL：Pi 刷屏 ↔ ESP 刷屏。
-//   切到 ESP 侧时显示 INA219 电压/电流遥测页（VBAT@0x40 / VBUS@0x41，
-//   10mΩ 采样电阻），每 500ms 刷新。
+// SW3（ESP BOOT 键，GPIO0）/ 键盘 □ 键：Pi 刷屏 ↔ ESP 本地 GUI。
+//   ESP GUI 是 4 页 Tab（触摸切换）：DASH 遥测 / BATT 电池曲线 /
+//   TOUCH 触摸测试 / PI SIG 信号状态，右上角常驻 Pi FPS 状态芯片。
 //   注意：MUX 在 ESP 侧期间，Pi 的触摸 I2C/INT 被切断（goodix 会报错，切回恢复）。
 
 #include <stdbool.h>
@@ -33,7 +33,12 @@
 
 #include "board_pins.h"
 #include "aw9523.h"
+#include "gt911.h"
 #include "lcd_spi_init.h"
+#include "sensors.h"
+#include "batt_log.h"
+#include "vsync_mon.h"
+#include "ui.h"
 #include "audio.h"
 #include "usb_device_uac.h"
 #include "uac_dbg.h"
@@ -47,203 +52,14 @@ static i2c_master_bus_handle_t s_i2c_bus;
 static i2c_master_dev_handle_t s_aw9523;
 static i2c_master_dev_handle_t s_ina_vbat;
 static i2c_master_dev_handle_t s_ina_vbus;
-static esp_lcd_panel_handle_t s_panel;
-static uint16_t *s_fb;
-
-#define C_BLACK  0x0000
-#define C_WHITE  0xFFFF
-#define C_GRAY   0x8410
-#define C_LGRAY  0xC618
-#define C_DARK   0x10A2   // 深灰背景
-#define C_NAVY   0x0951   // 头部深蓝
-#define C_GREEN  0x07E0
-#define C_DGREEN 0x03E0
-#define C_RED    0xF800
-#define C_YELL   0xFFE0
-#define C_CYAN   0x07FF
-
-static void fb_fill_rect(int x0, int y0, int w, int h, uint16_t color)
-{
-    if (!s_fb) return;
-    if (x0 < 0) { w += x0; x0 = 0; }
-    if (y0 < 0) { h += y0; y0 = 0; }
-    if (x0 + w > LCD_H_RES) w = LCD_H_RES - x0;
-    if (y0 + h > LCD_V_RES) h = LCD_V_RES - y0;
-    if (w <= 0 || h <= 0) return;
-    for (int y = y0; y < y0 + h; y++) {
-        uint16_t *row = s_fb + y * LCD_H_RES + x0;
-        for (int x = 0; x < w; x++) {
-            row[x] = color;
-        }
-    }
-}
-
-static const uint8_t *glyph5x7(char c)
-{
-    static const uint8_t A[] = { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 };
-    static const uint8_t B[] = { 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E };
-    static const uint8_t C[] = { 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E };
-    static const uint8_t D[] = { 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E };
-    static const uint8_t E[] = { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F };
-    static const uint8_t F[] = { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10 };
-    static const uint8_t G[] = { 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F };
-    static const uint8_t H[] = { 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 };
-    static const uint8_t I[] = { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F };
-    static const uint8_t J[] = { 0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C };
-    static const uint8_t K[] = { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 };
-    static const uint8_t L[] = { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F };
-    static const uint8_t M[] = { 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11 };
-    static const uint8_t N[] = { 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 };
-    static const uint8_t O[] = { 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E };
-    static const uint8_t P[] = { 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 };
-    static const uint8_t Q[] = { 0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D };
-    static const uint8_t R[] = { 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 };
-    static const uint8_t S[] = { 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E };
-    static const uint8_t T[] = { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 };
-    static const uint8_t U[] = { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E };
-    static const uint8_t V[] = { 0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04 };
-    static const uint8_t W[] = { 0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11 };
-    static const uint8_t X[] = { 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 };
-    static const uint8_t Y[] = { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 };
-    static const uint8_t Z[] = { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F };
-    static const uint8_t d0[] = { 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E };
-    static const uint8_t d1[] = { 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x1F };
-    static const uint8_t d2[] = { 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F };
-    static const uint8_t d3[] = { 0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E };
-    static const uint8_t d4[] = { 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02 };
-    static const uint8_t d5[] = { 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E };
-    static const uint8_t d6[] = { 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E };
-    static const uint8_t d7[] = { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 };
-    static const uint8_t d8[] = { 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E };
-    static const uint8_t d9[] = { 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C };
-    static const uint8_t dash[] = { 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00 };
-    static const uint8_t dot[]  = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C };
-    static const uint8_t pct[]  = { 0x19, 0x1A, 0x02, 0x04, 0x08, 0x0B, 0x13 };
-    static const uint8_t slash[] = { 0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10 };
-    static const uint8_t colon[] = { 0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00 };
-    static const uint8_t plus[] = { 0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00 };
-    static const uint8_t blank[] = { 0, 0, 0, 0, 0, 0, 0 };
-    switch (c) {
-    case 'A': return A; case 'B': return B; case 'C': return C; case 'D': return D;
-    case 'E': return E; case 'F': return F; case 'G': return G; case 'H': return H;
-    case 'I': return I; case 'J': return J; case 'K': return K; case 'L': return L;
-    case 'M': return M; case 'N': return N; case 'O': return O; case 'P': return P;
-    case 'Q': return Q; case 'R': return R; case 'S': return S; case 'T': return T;
-    case 'U': return U; case 'V': return V; case 'W': return W; case 'X': return X;
-    case 'Y': return Y; case 'Z': return Z;
-    case '0': return d0; case '1': return d1; case '2': return d2; case '3': return d3;
-    case '4': return d4; case '5': return d5; case '6': return d6; case '7': return d7;
-    case '8': return d8; case '9': return d9;
-    case '-': return dash; case '.': return dot; case '%': return pct;
-    case '/': return slash; case ':': return colon; case '+': return plus;
-    default: return blank;
-    }
-}
-
-static void fb_draw_text(int x, int y, const char *text, int scale, uint16_t color)
-{
-    for (const char *p = text; *p; p++, x += 6 * scale) {
-        const uint8_t *g = glyph5x7(*p);
-        for (int yy = 0; yy < 7; yy++) {
-            for (int xx = 0; xx < 5; xx++) {
-                if (g[yy] & (1 << (4 - xx))) {
-                    fb_fill_rect(x + xx * scale, y + yy * scale, scale, scale, color);
-                }
-            }
-        }
-    }
-}
-
-// 文本像素宽 = 字符数*6*scale - 尾字符后的 1 格间距
-static inline int text_w(const char *text, int scale)
-{
-    return (int)strlen(text) * 6 * scale - scale;
-}
-
-static void fb_draw_text_centered(int y, const char *text, int scale, uint16_t color)
-{
-    fb_draw_text((LCD_H_RES - text_w(text, scale)) / 2, y, text, scale, color);
-}
-
-// ---------------------------------------------------------------------------
-// INA219 迷你驱动（寄存器级，POR 默认配置 0x399F：32V 量程 / 12bit 连续采样）
-// bus voltage LSB=4mV（寄存器右移 3 位），shunt voltage LSB=10µV，I=Vshunt/10mΩ
-// ---------------------------------------------------------------------------
-#define INA219_REG_SHUNT_V 0x01
-#define INA219_REG_BUS_V   0x02
-#define INA219_SHUNT_OHM   0.010f
-
-static esp_err_t reg8_read(i2c_master_dev_handle_t dev, uint8_t reg,
-                           uint8_t *buf, size_t len)
-{
-    return i2c_master_transmit_receive(dev, &reg, 1, buf, len, 100);
-}
-
-static esp_err_t ina219_read16(i2c_master_dev_handle_t dev, uint8_t reg, uint16_t *val)
-{
-    uint8_t b[2];
-    ESP_RETURN_ON_ERROR(reg8_read(dev, reg, b, 2), TAG, "ina219 rd");
-    *val = ((uint16_t)b[0] << 8) | b[1];
-    return ESP_OK;
-}
-
-static esp_err_t ina219_read(i2c_master_dev_handle_t dev, float *bus_v, float *cur_a)
-{
-    uint16_t raw;
-    ESP_RETURN_ON_ERROR(ina219_read16(dev, INA219_REG_BUS_V, &raw), TAG, "bus_v");
-    *bus_v = (float)(raw >> 3) * 0.004f;
-    ESP_RETURN_ON_ERROR(ina219_read16(dev, INA219_REG_SHUNT_V, &raw), TAG, "shunt_v");
-    *cur_a = (int16_t)raw * 0.00001f / INA219_SHUNT_OHM;
-    return ESP_OK;
-}
-
-// CW2015 电量计 @0x62（常连 ESP 总线）：VCELL 14bit LSB 305µV，SOC 整数 %
-static esp_err_t cw2015_read(i2c_master_dev_handle_t dev, float *v, int *soc)
-{
-    uint8_t b[2];
-    ESP_RETURN_ON_ERROR(reg8_read(dev, 0x02, b, 2), TAG, "cw vcell");
-    *v = (float)((((uint16_t)b[0] & 0x3F) << 8) | b[1]) * 305e-6f;
-    ESP_RETURN_ON_ERROR(reg8_read(dev, 0x04, b, 2), TAG, "cw soc");
-    *soc = b[0];
-    return ESP_OK;
-}
-
-// STC3117 电量计 @0x70（⚠️ 在 MUX U71 后面，仅 MUX=ESP 侧时可达——
-// 遥测页恰好只在 ESP 持屏时刷新，天然满足）：V LSB 2.20mV，SOC LSB 1/512%
-//
-// ⚠️ POR 后芯片处于 standby（MODE.GG_RUN=0），电压/SOC 寄存器冻结在初次
-// 转换值（实测恒显 4.037V/85.4% 的根因，2026-08-15）。必须置 GG_RUN=1
-// 才持续转换。CC_CNF/VM_CNF 精确标定交给 Pi 内核驱动（stc3117_fuel_gauge，
-// 见 docs/pi_battery_gauge_gui_research_2026-08.md）；ESP 只确保芯片在跑，
-// 写入幂等，与 Pi 驱动不冲突。
-#define STC3117_REG_MODE   0x00
-#define STC3117_GG_RUN     (1 << 4)   // 1=运行；bit0 VMODE=0 混合模式（带库仑计）
-
-static void stc3117_ensure_running(i2c_master_dev_handle_t dev)
-{
-    uint8_t mode = 0;
-    if (!dev || reg8_read(dev, STC3117_REG_MODE, &mode, 1) != ESP_OK) return;
-    if (!(mode & STC3117_GG_RUN)) {
-        uint8_t cmd[2] = { STC3117_REG_MODE, (uint8_t)(mode | STC3117_GG_RUN) };
-        if (i2c_master_transmit(dev, cmd, 2, 100) == ESP_OK) {
-            ESP_LOGI(TAG, "STC3117 原为 standby（读数冻结），已置 GG_RUN 启动连续转换");
-        }
-    }
-}
-
-static esp_err_t stc3117_read(i2c_master_dev_handle_t dev, float *v, float *soc)
-{
-    uint8_t b[2];
-    ESP_RETURN_ON_ERROR(reg8_read(dev, 0x08, b, 2), TAG, "stc v");
-    *v = (float)(int16_t)(b[0] | (b[1] << 8)) * 2.20e-3f;
-    ESP_RETURN_ON_ERROR(reg8_read(dev, 0x02, b, 2), TAG, "stc soc");
-    *soc = (float)(uint16_t)(b[0] | (b[1] << 8)) / 512.0f;
-    return ESP_OK;
-}
-
 static i2c_master_dev_handle_t s_cw2015;
 static i2c_master_dev_handle_t s_stc3117;
+static i2c_master_dev_handle_t s_gt911;
+static esp_lcd_panel_handle_t s_panel;
 
+// ---------------------------------------------------------------------------
+// 传感器句柄
+// ---------------------------------------------------------------------------
 static i2c_master_dev_handle_t sensor_add(uint8_t addr)
 {
     i2c_device_config_t cfg = {
@@ -265,144 +81,11 @@ static void sensors_start(void)
     s_cw2015   = sensor_add(0x62);
     s_stc3117  = sensor_add(0x70);
     if (s_cw2015) {
-        // CW2015 POR 后可能在 sleep，写 MODE(0x0A)=0x00 唤醒
-        uint8_t wake[2] = { 0x0A, 0x00 };
-        i2c_master_transmit(s_cw2015, wake, 2, 100);
+        cw2015_wake(s_cw2015);
     }
     // 开机 GT911 复位窗口期间 MUX 在 ESP 侧，顺手启动 STC3117；
     // 若此刻 MUX 已归还 Pi 侧则静默失败，由遥测页刷新时兜底重试
     stc3117_ensure_running(s_stc3117);
-}
-
-// 板上 I2C 器件在位探测（名字 + 主/备地址；0 表示无备用地址）
-typedef struct { const char *name; uint8_t addr, alt; } sensor_desc_t;
-static const sensor_desc_t k_sensors[] = {
-    { "AW9523",  0x5B, 0    },  // U16 IO 扩展器
-    { "INA-BAT", 0x40, 0    },  // U4  电池电流计
-    { "INA-BUS", 0x41, 0    },  // U20 USB 电流计
-    { "CW2015",  0x62, 0    },  // U27 电量计
-    { "STC3117", 0x70, 0    },  // U53 电量计（MUX 后）
-    { "QMI8658", 0x6A, 0x6B },  // U6  IMU
-    { "RX8130",  0x32, 0    },  // U59 RTC
-    { "ES8389",  0x10, 0x11 },  // U12 Codec
-    { "GT911",   0x5D, 0x14 },  // 触摸（MUX 后）
-    { "KBD6R11", 0x1F, 0    },  // U32 键盘 STM32（QMK I2C 从机）
-};
-#define N_SENSORS (sizeof(k_sensors) / sizeof(k_sensors[0]))
-
-// ---------------------------------------------------------------------------
-// 遥测页 UI
-// ---------------------------------------------------------------------------
-// 卡片：深黑底 + 左侧彩色竖条 + 标题
-static void ui_card(int x, int y, int w, int h, uint16_t accent, const char *title)
-{
-    fb_fill_rect(x, y, w, h, C_BLACK);
-    fb_fill_rect(x, y, 8, h, accent);
-    fb_draw_text(x + 30, y + 16, title, 3, accent);
-}
-
-static void ui_draw_telemetry(uint32_t uptime_s)
-{
-    char buf[64];
-    float vbat_v = 0, vbat_a = 0, vbus_v = 0, vbus_a = 0;
-    float cw_v = 0, stc_v = 0, stc_soc = -1;
-    int cw_soc = -1;
-    bool vbat_ok = s_ina_vbat && ina219_read(s_ina_vbat, &vbat_v, &vbat_a) == ESP_OK;
-    bool vbus_ok = s_ina_vbus && ina219_read(s_ina_vbus, &vbus_v, &vbus_a) == ESP_OK;
-    if (!s_cw2015 || cw2015_read(s_cw2015, &cw_v, &cw_soc) != ESP_OK) cw_soc = -1;
-    stc3117_ensure_running(s_stc3117);   // 兜底：POR/BATFAIL 后重新拉起 GG_RUN
-    if (!s_stc3117 || stc3117_read(s_stc3117, &stc_v, &stc_soc) != ESP_OK) stc_soc = -1;
-
-    fb_fill_rect(0, 0, LCD_H_RES, LCD_V_RES, C_DARK);
-
-    // ---- 头部 ----
-    fb_fill_rect(0, 0, LCD_H_RES, 110, C_NAVY);
-    fb_fill_rect(0, 110, LCD_H_RES, 4, C_GREEN);
-    fb_draw_text_centered(22, "TYPIXDECK", 7, C_WHITE);
-    fb_draw_text_centered(128, "ESP32-S3 SYSTEM MONITOR", 3, C_GRAY);
-
-    // ---- 电池卡片 ----
-    int soc = cw_soc >= 0 ? cw_soc : (int)stc_soc;   // 主 SOC 优先 CW2015
-    uint16_t soc_col = soc < 0   ? C_GRAY
-                     : soc < 15  ? C_RED
-                     : soc < 40  ? C_YELL : C_GREEN;
-    ui_card(40, 170, 944, 240, C_YELL, "BATTERY");
-    if (soc >= 0) {
-        snprintf(buf, sizeof(buf), "%d%%", soc);
-        fb_draw_text(80, 220, buf, 11, soc_col);
-    } else {
-        fb_draw_text(80, 240, "--%", 9, C_GRAY);
-    }
-    // 电量条
-    {
-        int bx = 80, by = 330, bw = 320, bh = 40;
-        fb_fill_rect(bx - 3, by - 3, bw + 6, bh + 6, C_LGRAY);
-        fb_fill_rect(bx, by, bw, bh, C_DARK);
-        if (soc > 0) fb_fill_rect(bx, by, bw * soc / 100, bh, soc_col);
-    }
-    if (vbat_ok) {
-        snprintf(buf, sizeof(buf), "%.3f V", vbat_v);
-        fb_draw_text(490, 215, buf, 6, C_WHITE);
-        snprintf(buf, sizeof(buf), "%+.0f MA  %.2f W", vbat_a * 1000.0f, vbat_v * vbat_a);
-        fb_draw_text(490, 280, buf, 4, C_LGRAY);
-        // 正电流=放电（INA219 IN+=VBAT，IN-=负载侧）
-        const char *st = vbat_a > 0.02f ? "DISCHARGING"
-                       : vbat_a < -0.02f ? "CHARGING" : "IDLE";
-        fb_draw_text(490, 335, st,
-                     4, vbat_a < -0.02f ? C_GREEN : (vbat_a > 0.02f ? C_YELL : C_GRAY));
-    } else {
-        fb_draw_text(490, 260, "INA219 READ FAIL", 4, C_RED);
-    }
-    // 两颗电量计交叉读数
-    if (cw_soc >= 0)
-        snprintf(buf, sizeof(buf), "CW2015 %.3fV %d%%", cw_v, cw_soc);
-    else
-        snprintf(buf, sizeof(buf), "CW2015 --");
-    fb_draw_text(80, 382, buf, 2, C_GRAY);
-    if (stc_soc >= 0)
-        snprintf(buf, sizeof(buf), "STC3117 %.3fV %.1f%%", stc_v, stc_soc);
-    else
-        snprintf(buf, sizeof(buf), "STC3117 --");
-    fb_draw_text(490, 382, buf, 2, C_GRAY);
-
-    // ---- USB 供电卡片 ----
-    ui_card(40, 430, 944, 120, C_CYAN, "USB VBUS");
-    if (vbus_ok) {
-        snprintf(buf, sizeof(buf), "%.3f V", vbus_v);
-        fb_draw_text(80, 480, buf, 5, C_WHITE);
-        snprintf(buf, sizeof(buf), "%.0f MA", vbus_a * 1000.0f);
-        fb_draw_text(430, 480, buf, 5, C_LGRAY);
-        snprintf(buf, sizeof(buf), "%.2f W", vbus_v * vbus_a);
-        fb_draw_text(720, 480, buf, 5, C_LGRAY);
-    } else {
-        fb_draw_text(80, 480, "INA219 READ FAIL", 4, C_RED);
-    }
-
-    // ---- 传感器在位卡片 ----
-    int n_ok = 0;
-    bool present[N_SENSORS];
-    for (int i = 0; i < N_SENSORS; i++) {
-        present[i] = i2c_master_probe(s_i2c_bus, k_sensors[i].addr, 50) == ESP_OK ||
-                     (k_sensors[i].alt &&
-                      i2c_master_probe(s_i2c_bus, k_sensors[i].alt, 50) == ESP_OK);
-        if (present[i]) n_ok++;
-    }
-    snprintf(buf, sizeof(buf), "SENSORS %d/%d", n_ok, (int)N_SENSORS);
-    ui_card(40, 570, 944, 130, C_GREEN, buf);
-    for (int i = 0; i < N_SENSORS; i++) {
-        int col = i % 5, row = i / 5;
-        int x = 80 + col * 182, y = 620 + row * 40;
-        fb_fill_rect(x, y + 2, 12, 12, present[i] ? C_GREEN : C_RED);
-        fb_draw_text(x + 24, y, k_sensors[i].name, 2,
-                     present[i] ? C_LGRAY : C_GRAY);
-    }
-
-    // ---- 底部 ----
-    snprintf(buf, sizeof(buf), "UPTIME %lu S   SW3 OR SQUARE KEY - BACK TO PI",
-             (unsigned long)uptime_s);
-    fb_draw_text_centered(725, buf, 3, C_YELL);
-
-    esp_lcd_panel_draw_bitmap(s_panel, 0, 0, LCD_H_RES, LCD_V_RES, s_fb);
 }
 
 // ---------------------------------------------------------------------------
@@ -478,13 +161,7 @@ static esp_err_t rgb_panel_start(void)
     ESP_RETURN_ON_ERROR(esp_lcd_new_rgb_panel(&cfg, &s_panel), TAG, "new_rgb_panel");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "panel_reset");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "panel_init");
-
-    s_fb = heap_caps_malloc(LCD_H_RES * LCD_V_RES * sizeof(uint16_t),
-                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_fb) {
-        return ESP_ERR_NO_MEM;
-    }
-    ESP_LOGI(TAG, "RGB 面板已启动，framebuffer=%d KB", LCD_H_RES * LCD_V_RES * 2 / 1024);
+    ESP_LOGI(TAG, "RGB 面板已启动");
     return ESP_OK;
 }
 
@@ -550,12 +227,25 @@ static void boot_btn_start(void)
     gpio_config(&cfg);
 }
 
-// MUX 切换：P0_0 保持推挽输出，1=ESP 侧，0=Pi 侧（与 R105 下拉同电平）
+// MUX 期望归属（aw9523_init 后在 ESP 侧）。AW9523 健康检查在自愈重建后按此
+// 恢复 MUX，所以 mux_select 即使当下写失败，总线恢复后 ~1s 内也会被纠正。
+static volatile bool s_mux_esp_side = true;
+
+// MUX 切换：P0_0 保持推挽输出，1=ESP 侧，0=Pi 侧（与 R105 下拉同电平）。
+// I2C 瞬时失败（ESD 毛刺）重试 3 次——这条写失败会导致屏幕归属卡死，值得抢救。
 static esp_err_t mux_select(bool esp_side)
 {
-    return aw9523_update_bits(s_aw9523, AW9523_REG_OUTPUT_P0,
-                              AW9523_P0_MUX_SEL,
-                              esp_side ? AW9523_P0_MUX_SEL : 0);
+    s_mux_esp_side = esp_side;
+    esp_err_t err = ESP_FAIL;
+    for (int i = 0; i < 3; i++) {
+        err = aw9523_update_bits(s_aw9523, AW9523_REG_OUTPUT_P0,
+                                 AW9523_P0_MUX_SEL,
+                                 esp_side ? AW9523_P0_MUX_SEL : 0);
+        if (err == ESP_OK) return ESP_OK;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    ESP_LOGE(TAG, "MUX 写入失败（重试 3 次）：%s，等健康检查自愈", esp_err_to_name(err));
+    return err;
 }
 
 // ---------------------------------------------------------------------------
@@ -564,7 +254,7 @@ static esp_err_t mux_select(bool esp_side)
 //   reg 0x00=ID(0x6B)  reg 0x01=FIFO 计数  reg 0x02=弹出事件（连续读连续弹）
 //   事件字节：bit7=按下, bit6:4=行, bit3:0=列；0x00=FIFO 空
 // 键盘常供电、SCL/SDA 恒挂 ESP 总线（不走 MUX），Pi 持屏期间照样收键。
-// □ 键 =(0,1)：按下请求切屏（Pi ↔ ESP 遥测页），与 SW3 等价。
+// □ 键 =(0,1)：按下请求切屏（Pi ↔ ESP GUI），与 SW3 等价。
 // ---------------------------------------------------------------------------
 #define KBD_I2C_ADDR       0x1F
 #define KBD_REG_FIFO_COUNT 0x01
@@ -915,7 +605,7 @@ static void cdc_stats_task(void *arg)
         int n = snprintf(buf, sizeof(buf),
             "[%lu] rx=%lu pkt/s %lu B/s sz=%lu..%lu gap>1.5ms=%lu maxgap=%luus "
             "clr=%lu | cb=%lu/s | tx=%lu pkt/s %lu B/s mic_cb=%lu/s "
-            "micL=%.0f micR=%.0f | itf open=%lu close=%lu mnt=%lu sus=%lu\r\n",
+            "micL=%.0f micR=%.0f | vsync=%.1ffps | itf open=%lu close=%lu mnt=%lu sus=%lu\r\n",
             (unsigned long)tick,
             (unsigned long)(cur.rx_pkts - prev.rx_pkts),
             (unsigned long)(cur.rx_bytes - prev.rx_bytes),
@@ -929,6 +619,7 @@ static void cdc_stats_task(void *arg)
             (unsigned long)(cur.tx_bytes - prev.tx_bytes),
             (unsigned long)(mcalls - prev_mic_calls),
             rms[0], rms[1],
+            vsync_mon_fps(),
             (unsigned long)cur.set_itf,
             (unsigned long)cur.itf_close,
             (unsigned long)cur.mount,
@@ -989,11 +680,13 @@ static void amp_power(bool on)
     ESP_LOGI(TAG, "功放 %s", on ? "开" : "关");
 }
 
-// HP_DET(P1_7) 原始电平（1=上拉态/0=对地）——极性未实测，报告用 raw 值
+// HP_DET(P1_7) 原始电平（1=上拉态/0=对地），I2C 读失败返回 -1。
+// ⚠️ 不能忽略失败：曾把失败当 0 用，ESD 打挂总线的瞬间凭空产生 "1->0"
+//   幻影插拔事件（HP=0 抢屏），实为 I2C 读挂了（2026-08-16 实翻车）。
 static int hp_det_raw(void)
 {
     uint8_t in = 0;
-    aw9523_read_reg(s_aw9523, AW9523_REG_INPUT_P1, &in);
+    if (aw9523_read_reg(s_aw9523, AW9523_REG_INPUT_P1, &in) != ESP_OK) return -1;
     return (in & AW9523_P1_HP_DET) ? 1 : 0;
 }
 
@@ -1002,10 +695,48 @@ static bool headphone_plugged(void)
     return hp_det_raw() == 0;   // 假设 LOW = 插了（R166 上拉，插入接地）——待实测确认
 }
 
+// AW9523 健康检查（hp_amp_task 内 1Hz 调用）：
+//   - CONFIG_P0 读得出但 ≠ 期望值 0xFE → 芯片被 ESD/毛刺复位回默认态 → 重建配置
+//     并按 s_mux_esp_side 恢复 MUX；
+//   - 连续 3 次读失败 → 总线疑似被某从机拽死（SDA 卡低）→ i2c_master_bus_reset。
+static void aw9523_health_tick(void)
+{
+    static int fail_streak = 0;
+    uint8_t cfg = 0;
+    esp_err_t err = aw9523_read_reg(s_aw9523, AW9523_REG_CONFIG_P0, &cfg);
+    if (err != ESP_OK) {
+        if (++fail_streak >= 3) {
+            fail_streak = 0;
+            ESP_LOGE(TAG, "AW9523 连续读失败（%s），复位 I2C 总线", esp_err_to_name(err));
+            i2c_master_bus_reset(s_i2c_bus);
+        }
+        return;
+    }
+    fail_streak = 0;
+    if (cfg != (0xFF & ~AW9523_P0_MUX_SEL)) {
+        ESP_LOGE(TAG, "AW9523 配置丢失（CONFIG_P0=0x%02X，期望 0xFE）——疑似被静电复位，重建",
+                 cfg);
+        aw9523_reinit(s_aw9523, s_mux_esp_side);
+        return;
+    }
+    // vsync 探测锁定后 INT_P0 必须保持全屏蔽（INTN 与 LCD CS 共线，重开
+    // P0_7 = I2S 码流灌面板）。锁定前不碰：vsync_mon 自己管理该位
+    // （含风暴退避的临时屏蔽），此处强写会与之打架。
+    if (vsync_mon_locked()) {
+        uint8_t intp0 = 0;
+        if (aw9523_read_reg(s_aw9523, AW9523_REG_INT_P0, &intp0) == ESP_OK &&
+            intp0 != 0xFF) {
+            ESP_LOGE(TAG, "AW9523 INT_P0=0x%02X 异常（应全屏蔽）——重写保护 LCD CS", intp0);
+            aw9523_write_reg(s_aw9523, AW9523_REG_INT_P0, 0xFF);
+        }
+    }
+}
+
 static void hp_amp_task(void *arg)
 {
     (void)arg;
     int raw = hp_det_raw();
+    if (raw < 0) raw = 1;                   // 读失败按"未插"起步，等健康检查自愈
     amp_power(raw != 0);                    // 开机按当前状态设一次（raw=1 假设未插→功放开）
     // ★ 喇叭链路左右反接补偿（2026-08-16 用户听测实锤：耳机对、外放反）：
     //   外放（未插耳机）时 DAC 数字互换 L/R，插耳机恢复正常。
@@ -1016,10 +747,15 @@ static void hp_amp_task(void *arg)
     bool swap_ok = (audio_set_dac_lr_swap(raw != 0) == 0);
     ESP_LOGI(TAG, "耳机检测启动：HP_DET raw=%d（%s，极性待实测）", raw,
              raw ? "假设未插→功放开+声道互换" : "假设已插→功放关+声道正常");
+    int health_tick = 0;
     while (1) {
         if (!swap_ok) swap_ok = (audio_set_dac_lr_swap(raw != 0) == 0);
+        if (++health_tick >= 10) {           // 1Hz：AW9523 复位/总线卡死自愈
+            health_tick = 0;
+            aw9523_health_tick();
+        }
         int now = hp_det_raw();
-        if (now != raw) {
+        if (now >= 0 && now != raw) {        // 读失败(-1)不算插拔事件
             vTaskDelay(pdMS_TO_TICKS(50));   // 二次采样一致才算数（去抖）
             if (hp_det_raw() == now) {
                 int ev = now ? 1 : 2;        // 1: 0->1, 2: 1->0
@@ -1037,48 +773,34 @@ static void hp_amp_task(void *arg)
 }
 
 // ---------------------------------------------------------------------------
-// HP_DET 抢屏页：大字 raw 电平 + 插拔猜测（待确认）+ 双声道 RMS 仪表
+// 触摸：GT911 惰性初始化（仅 MUX=ESP 侧时总线可达）+ 轮询
 // ---------------------------------------------------------------------------
-static void ui_draw_hp_page(int raw)
+static bool touch_ensure_init(void)
 {
-    char buf[64];
-    fb_fill_rect(0, 0, LCD_H_RES, LCD_V_RES, C_DARK);
-    fb_fill_rect(0, 0, LCD_H_RES, 110, C_NAVY);
-    fb_fill_rect(0, 110, LCD_H_RES, 4, C_CYAN);
-    fb_draw_text_centered(30, "HEADPHONE EVENT", 5, C_WHITE);
-
-    snprintf(buf, sizeof(buf), "HP-DET=%d", raw);
-    fb_draw_text_centered(180, buf, 14, raw ? C_GREEN : C_YELL);
-
-    // 极性猜测：R166 上拉到 AUDIO_3V3，假设插入接地 → LOW=插入（待实测确认）
-    fb_draw_text_centered(340, raw ? "GUESS: UNPLUGGED" : "GUESS: PLUGGED", 6, C_LGRAY);
-    fb_draw_text_centered(410, "POLARITY UNCONFIRMED", 3, C_GRAY);
-
-    // 双声道 RMS 仪表（最近 1 秒窗口，主机在录音时才有数据流）
-    float l = s_mic_rms[0], r = s_mic_rms[1];
-    snprintf(buf, sizeof(buf), "MIC RMS L:%5.0f R:%5.0f", l, r);
-    fb_draw_text_centered(500, buf, 5, C_CYAN);
-    // 简易电平条（满量程按 4000 归一，方便看语音级信号）
-    int bw = 700, bh = 36, bx = (LCD_H_RES - bw) / 2;
-    for (int ch = 0; ch < 2; ch++) {
-        int by = 580 + ch * 60;
-        float v = ch == 0 ? l : r;
-        int fill = (int)(v / 4000.0f * bw);
-        if (fill > bw) fill = bw;
-        fb_fill_rect(bx - 3, by - 3, bw + 6, bh + 6, C_LGRAY);
-        fb_fill_rect(bx, by, bw, bh, C_BLACK);
-        if (fill > 0) fb_fill_rect(bx, by, fill, bh, ch == 0 ? C_GREEN : C_CYAN);
-        fb_draw_text(bx - 40, by + 6, ch == 0 ? "L" : "R", 3, C_WHITE);
+    if (s_gt911) return true;
+    if (gt911_init(s_i2c_bus, &s_gt911) == ESP_OK) {
+        ESP_LOGI(TAG, "GT911 触摸就绪");
+        return true;
     }
-
-    fb_draw_text_centered(725, "BACK TO PI IN 2S", 3, C_YELL);
-    esp_lcd_panel_draw_bitmap(s_panel, 0, 0, LCD_H_RES, LCD_V_RES, s_fb);
+    return false;
 }
+
+// ---------------------------------------------------------------------------
+// 显示归属状态机
+// ---------------------------------------------------------------------------
+typedef enum {
+    ST_BOOT_ANIM = 0,   // 开机动画（MUX=ESP），等 Pi VSYNC；一有信号立即交 Pi
+    ST_PI,              // Pi 持屏
+    ST_ESP_UI,          // ESP 本地 GUI（Tab 界面）
+} disp_state_t;
+
+// 开机动画等待多久后追加 NO SIGNAL 提示
+#define BOOT_HINT_MS   20000
 
 void app_main(void)
 {
     vTaskDelay(pdMS_TO_TICKS(100));
-    ESP_LOGI(TAG, "TypixDeck dual-source display switch + power monitor");
+    ESP_LOGI(TAG, "TypixDeck dual-source display switch + power monitor + GUI");
 
     if (i2c_start() != ESP_OK) {
         ESP_LOGE(TAG, "I2C/AW9523 初始化失败，停止");
@@ -1089,12 +811,13 @@ void app_main(void)
         ESP_LOGE(TAG, "LCD SPI 初始化失败，停止");
         return;
     }
-    // GT911 INT-low 干净复位（best-effort，此窗口 INT/SDA/SCL 走 ESP 侧可达；
-    // 失败不阻塞——Pi 侧触摸可能异常但显示链路不受影响）
+    // GT911 INT-low 干净复位 + 触摸初始化（此窗口 INT/SDA/SCL 走 ESP 侧可达；
+    // 失败不阻塞——进 ESP GUI 时再惰性重试）
     esp_err_t err = aw9523_gt911_reset(s_aw9523);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "GT911 复位失败（%s），Pi 侧触摸可能异常", esp_err_to_name(err));
+        ESP_LOGE(TAG, "GT911 复位失败（%s），触摸可能异常", esp_err_to_name(err));
     }
+    touch_ensure_init();
 
     if (rgb_panel_start() != ESP_OK) {
         ESP_LOGE(TAG, "RGB 面板启动失败，停止");
@@ -1102,7 +825,27 @@ void app_main(void)
     }
     backlight_on();
     sensors_start();
-    ui_draw_telemetry(0);
+
+    ui_ctx_t ui_ctx = {
+        .bus = s_i2c_bus,
+        .ina_vbat = s_ina_vbat,
+        .ina_vbus = s_ina_vbus,
+        .cw2015 = s_cw2015,
+        .stc3117 = s_stc3117,
+    };
+    if (ui_init(s_panel, &ui_ctx) != ESP_OK) {
+        ESP_LOGE(TAG, "UI framebuffer 分配失败，停止");
+        return;
+    }
+    ui_boot_anim_tick(0, false);   // 先出 logo 再继续（MUX 已在 ESP 侧）
+
+    // VSYNC 探测：必须在 lcd_jd9168s_spi_init 之后（GPIO5 已被 spi_bus_free 释放）
+    if (vsync_mon_start(s_aw9523) != ESP_OK) {
+        ESP_LOGE(TAG, "VSYNC 探测启动失败（不影响其余功能）");
+    }
+
+    // 电池历史采样（INA219 VBAT + CW2015 常连总线，谁持屏都在跑）
+    batt_log_start(s_ina_vbat, s_cw2015);
 
     // 显式开 ES8389 模拟电源：DAC_3V3_EN(P1_0) 推挽驱高（R84 上拉对 U31 不够稳）
     aw9523_update_bits(s_aw9523, AW9523_REG_OUTPUT_P1, AW9523_P1_DAC_3V3_EN, AW9523_P1_DAC_3V3_EN);
@@ -1117,13 +860,6 @@ void app_main(void)
     // audio(ES8389) + USB(UAC) 放独立 16KB 任务跑（栈深，避免 app_main 8KB 溢出）
     xTaskCreate(audio_usb_task, "audio_usb", 16384, s_i2c_bus, 5, NULL);
 
-    // 默认交给 Pi（CM 与 ESP 同时上电，Pi 数秒后出图）
-    bool esp_owns = false;
-    if (mux_select(false) != ESP_OK) {
-        ESP_LOGE(TAG, "MUX 切 Pi 失败");
-    }
-    ESP_LOGI(TAG, "初始化完成：MUX=Pi 侧，按 SW3(BOOT) 或键盘 □ 键切换 ESP 遥测页");
-
     boot_btn_start();
 
     // 键盘 I2C 从机：加设备 + 事件轮询任务（□ 键按下置 s_kbd_toggle_req）
@@ -1132,61 +868,129 @@ void app_main(void)
         xTaskCreate(kbd_task, "kbd", 4096, NULL, 5, NULL);
     }
 
+    // ---- 开机动画阶段：MUX 保持 ESP 侧，等 Pi VSYNC ----
+    ESP_LOGI(TAG, "开机动画中：等待 Pi VSYNC（探测到立即交屏），□/SW3 可直接进 ESP GUI");
+
+    disp_state_t state = ST_BOOT_ANIM;
     int prev_lvl = 1;
+    int anim_frame = 0;
+    int64_t boot_ms0 = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
     int64_t last_draw_ms = 0;
     int64_t hp_grab_until_ms = 0;   // >now 表示 HP_DET 抢屏窗口生效中
+    disp_state_t hp_restore_state = ST_PI;
+
     while (1) {
         int lvl = gpio_get_level(PIN_BOOT_BTN);
         int64_t now_ms = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-        bool toggle = (prev_lvl == 1 && lvl == 0);   // SW3 按下沿（50ms 轮询自带消抖）
+        bool toggle = (prev_lvl == 1 && lvl == 0);   // SW3 按下沿（轮询自带消抖）
+        prev_lvl = lvl;
         if (s_kbd_toggle_req) {
             s_kbd_toggle_req = false;
             toggle = true;                            // 键盘 □ 键，与 SW3 等价
         }
-        if (toggle) {
-            esp_owns = !esp_owns;
-            ESP_LOGI(TAG, "切屏请求 → 屏幕切到 %s", esp_owns ? "ESP" : "Pi");
-            hp_grab_until_ms = 0;                  // 手动切换优先，取消抢屏窗口
-            if (esp_owns) {
-                ui_draw_telemetry(now_ms / 1000);  // 先备好画面再切 MUX
-                last_draw_ms = now_ms;
-            }
-            if (mux_select(esp_owns) != ESP_OK) {
-                ESP_LOGE(TAG, "MUX 切换失败");
-            }
-        }
-        prev_lvl = lvl;
 
-        // HP_DET 插拔事件 → ESP 抢屏 2 秒显示状态页，到时切回原归属
+        // ---- HP_DET 插拔事件 → ESP 抢屏 2 秒显示状态页，到时恢复 ----
+        // （开机动画阶段忽略：动画本来就在 ESP 侧，别打断）
         if (s_hp_grab_event) {
             int ev = s_hp_grab_event;
             s_hp_grab_event = 0;
-            ui_draw_hp_page(ev == 1 ? 1 : 0);      // 先备好画面再切 MUX
-            if (mux_select(true) == ESP_OK) {
+            if (state != ST_BOOT_ANIM) {
+                hp_restore_state = state;
+                ui_draw_hp_page(ev == 1 ? 1 : 0, s_mic_rms[0], s_mic_rms[1]);
+                mux_select(true);
+                // 无条件设恢复窗口：即使 MUX 写失败也要按时恢复画面归属，
+                // 不能让 HP 页永久占屏（写失败由健康检查兜底纠正 MUX）
                 hp_grab_until_ms = now_ms + 2000;
             }
         }
         if (hp_grab_until_ms) {
-            if (now_ms >= hp_grab_until_ms) {
+            if (toggle) {
+                // 手动切换优先：取消抢屏窗口，按原归属翻转
                 hp_grab_until_ms = 0;
-                if (mux_select(esp_owns) != ESP_OK) {  // 恢复 SW3 决定的归属
-                    ESP_LOGE(TAG, "MUX 恢复失败");
-                }
-                if (esp_owns) {
-                    ui_draw_telemetry(now_ms / 1000);
+                state = hp_restore_state;
+            } else if (now_ms >= hp_grab_until_ms) {
+                hp_grab_until_ms = 0;
+                state = hp_restore_state;
+                mux_select(state == ST_ESP_UI);
+                if (state == ST_ESP_UI) {
+                    ui_page_draw(now_ms / 1000);
                     last_draw_ms = now_ms;
                 }
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
             } else {
-                vTaskDelay(pdMS_TO_TICKS(50));     // 抢屏窗口内不跑遥测重绘
+                vTaskDelay(pdMS_TO_TICKS(50));     // 抢屏窗口内不跑其它重绘
                 continue;
             }
         }
 
-        if (esp_owns && now_ms - last_draw_ms >= 500) {
-            ui_draw_telemetry(now_ms / 1000);
-            last_draw_ms = now_ms;
+        switch (state) {
+        case ST_BOOT_ANIM:
+            if (vsync_mon_signal()) {
+                // Pi 出图了：立即交屏，此后不再自动切回（除非 □）
+                ESP_LOGI(TAG, "检测到 Pi VSYNC（%.1f fps），交屏给 Pi", vsync_mon_fps());
+                mux_select(false);
+                state = ST_PI;
+                break;
+            }
+            if (toggle) {
+                // Pi 还没出图，用户主动进 ESP GUI（MUX 本来就在 ESP 侧）
+                state = ST_ESP_UI;
+                ui_page_draw(now_ms / 1000);
+                last_draw_ms = now_ms;
+                break;
+            }
+            ui_boot_anim_tick(anim_frame++, now_ms - boot_ms0 > BOOT_HINT_MS);
+            vTaskDelay(pdMS_TO_TICKS(80));   // ~12fps 旋转
+            continue;
+
+        case ST_PI:
+            if (toggle) {
+                ESP_LOGI(TAG, "切屏 → ESP GUI");
+                touch_ensure_init();               // MUX 即将到 ESP 侧，触摸可用
+                ui_page_draw(now_ms / 1000);       // 先备好画面再切 MUX
+                last_draw_ms = now_ms;
+                if (mux_select(true) != ESP_OK) {
+                    ESP_LOGE(TAG, "MUX 切换失败");
+                }
+                state = ST_ESP_UI;
+            }
+            break;
+
+        case ST_ESP_UI:
+            if (toggle) {
+                ESP_LOGI(TAG, "切屏 → Pi");
+                if (mux_select(false) != ESP_OK) {
+                    ESP_LOGE(TAG, "MUX 切换失败");
+                }
+                state = ST_PI;
+                break;
+            }
+            // 触摸轮询（MUX 在 ESP 侧，GT911 走 ESP I2C）
+            if (s_gt911 || touch_ensure_init()) {
+                gt911_touch_t t;
+                esp_err_t terr = gt911_read(s_gt911, &t);
+                if (terr == ESP_OK) {
+                    if (t.count > 0) {
+                        ui_handle_touch(t.x, t.y, true);
+                    } else {
+                        ui_handle_touch(0, 0, false);
+                    }
+                }
+            }
+            ui_maybe_flush();                      // 触摸轨迹增量冲刷（限频 15Hz）
+            if (now_ms - last_draw_ms >= 500) {
+                ui_page_draw(now_ms / 1000);
+                last_draw_ms = now_ms;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));         // 触摸响应 50Hz
+            continue;
+
+        default:
+            break;
         }
+
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }

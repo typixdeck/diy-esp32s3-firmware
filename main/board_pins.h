@@ -10,11 +10,12 @@
 
 // ---- AW9523B IO 扩展器（U16，AD0=AD1=3V3）----
 #define AW9523_I2C_ADDR    0x5B
-// P1_1 = IOE_LCD_RST → R185 → LCD_RST（R101 10K 上拉 3V3）
-// P1_4 = MUX_SEL     → R202 → TPG4899 ×7 SEL（R105 下拉，0=Pi 侧 / 1=ESP 侧）
-// P0_4 = S3_TP_RST   → R78  → GT911 复位
-// P0_6 = ESP_TP_INT（输入）
-// ⚠️ INTN 脚经 R82 连到 ESP_LCD_CS(GPIO5)，必须屏蔽全部中断！
+// 引脚→功能以 aw9523.h 为准（2026-08-06 网表逐脚核实）：
+//   P0_0 = MUX_SEL（R202 → TPG4899 ×7 SEL，R105 下拉=Pi 侧 / 1=ESP 侧）
+//   P1_1 = IOE_LCD_RST、P1_4 = S3_TP_RST、P1_6 = ESP_TP_INT（走 MUX）
+//   P0_7 = Pi GPIO2 = DPI VSYNC（R83 0Ω tap，vsync_mon 探测 Pi 刷屏用）
+// ⚠️ INTN 脚经 R82 连到 ESP_LCD_CS(GPIO5)：LCD SPI init 期间必须全屏蔽中断；
+//    init 完成后 vsync_mon 只解开 P0_7 一位（GPIO5 复用为中断输入）。
 
 // ---- JD9168S SPI 初始化（走 R183/R184/R186，与 CH32 的 R179-182 并联）----
 #define PIN_LCD_CS         5   // U57.10 ESP_LCD_CS
