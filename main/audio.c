@@ -17,6 +17,7 @@ static i2s_chan_handle_t      s_tx;
 static i2s_chan_handle_t      s_rx;
 static esp_codec_dev_handle_t s_codec_out;
 static esp_codec_dev_handle_t s_codec_in;
+static const audio_codec_ctrl_if_t *s_ctrl_if;   // 直写寄存器用（DAC 声道互换）
 
 static void i2s_setup(int hz)
 {
@@ -46,6 +47,7 @@ static void es8389_setup(int hz, int ch, uint8_t es7bit)
     audio_codec_i2c_cfg_t ctrl = { .port = 0, .addr = es7bit << 1, .bus_handle = s_bus };
     const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&ctrl);
     assert(ctrl_if);
+    s_ctrl_if = ctrl_if;
     audio_codec_i2s_cfg_t data = { .port = 0, .tx_handle = s_tx, .rx_handle = s_rx };
     const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&data);
     assert(data_if);
@@ -115,3 +117,21 @@ void audio_start(i2c_master_bus_handle_t bus)
 
 esp_codec_dev_handle_t audio_codec_handle(void)    { return s_codec_out; }
 esp_codec_dev_handle_t audio_codec_in_handle(void) { return s_codec_in; }
+
+// DAC 左右声道数字互换：REG0x44 (DAC MIX CONTROL) bit5=DAC2→DAC1、
+// bit4=DAC1→DAC2，两位同置 0x30 即完整 L/R 互换（ES8389_DS Rev1.0）。
+// 用途：本板喇叭链路左右反接（耳机不反——CN10 切换触点配对与原理图假设
+// 相反，或两喇叭装位互换，电气上不可区分），外放时互换、插耳机时恢复。
+// 硬件分析与下版 PCB 修改见 docs/typixdeck_speaker_lr_swap_2026-08.md。
+// 幂等：读-改-写，值一致不产生 I2C 写。
+int audio_set_dac_lr_swap(bool swap)
+{
+    if (!s_ctrl_if) return -1;
+    uint8_t v = 0;
+    if (s_ctrl_if->read_reg(s_ctrl_if, 0x44, 1, &v, 1) != 0) return -1;
+    uint8_t nv = swap ? (uint8_t)(v | 0x30) : (uint8_t)(v & ~0x30);
+    if (nv == v) return 0;
+    int ret = s_ctrl_if->write_reg(s_ctrl_if, 0x44, 1, &nv, 1);
+    ESP_LOGI(TAG, "DAC L/R %s (REG0x44: 0x%02X -> 0x%02X)", swap ? "互换" : "正常", v, nv);
+    return ret;
+}

@@ -1007,9 +1007,17 @@ static void hp_amp_task(void *arg)
     (void)arg;
     int raw = hp_det_raw();
     amp_power(raw != 0);                    // 开机按当前状态设一次（raw=1 假设未插→功放开）
+    // ★ 喇叭链路左右反接补偿（2026-08-16 用户听测实锤：耳机对、外放反）：
+    //   外放（未插耳机）时 DAC 数字互换 L/R，插耳机恢复正常。
+    //   根因（CN10 切换触点配对 vs 喇叭装位）与下版 PCB 修改见
+    //   docs/typixdeck_speaker_lr_swap_2026-08.md
+    //   注意本任务先于 audio_usb_task 里的 audio_start 启动，codec 未就绪时
+    //   （返回 -1）在轮询循环里兜底重试，直到首次写入成功。
+    bool swap_ok = (audio_set_dac_lr_swap(raw != 0) == 0);
     ESP_LOGI(TAG, "耳机检测启动：HP_DET raw=%d（%s，极性待实测）", raw,
-             raw ? "假设未插→功放开" : "假设已插→功放关");
+             raw ? "假设未插→功放开+声道互换" : "假设已插→功放关+声道正常");
     while (1) {
+        if (!swap_ok) swap_ok = (audio_set_dac_lr_swap(raw != 0) == 0);
         int now = hp_det_raw();
         if (now != raw) {
             vTaskDelay(pdMS_TO_TICKS(50));   // 二次采样一致才算数（去抖）
@@ -1017,6 +1025,7 @@ static void hp_amp_task(void *arg)
                 int ev = now ? 1 : 2;        // 1: 0->1, 2: 1->0
                 raw = now;
                 amp_power(raw != 0);         // 假设极性：raw=0 插→关功放
+                swap_ok = (audio_set_dac_lr_swap(raw != 0) == 0);   // 外放=互换，耳机=正常
                 s_hp_event_ms = (uint32_t)((int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS);
                 s_hp_cdc_event  = ev;
                 s_hp_grab_event = ev;
