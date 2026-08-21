@@ -408,6 +408,56 @@ static void sensors_probe_maybe(void)
     }
 }
 
+// 电池容量行：学习到的总容量 + 按 SOC 折算的剩余电量（两个数字都写清楚，
+// 2026-08-21 用户要求；容量 = batt_log 库仑计数自学习值，默认种子 3000mAh）
+static void draw_capacity_line(int x, int y, int soc)
+{
+    char cbuf[96];
+    float cap = batt_log_capacity_mah();
+    if (soc > 0)
+        snprintf(cbuf, sizeof(cbuf),
+                 tr("EST. TOTAL %.0fmAh, %.0fmAh LEFT",
+                    "估算总容量 %.0fmAh，剩余 %.0fmAh"),
+                 cap, cap * soc / 100.0f);
+    else
+        snprintf(cbuf, sizeof(cbuf),
+                 tr("EST. TOTAL %.0fmAh", "估算总容量 %.0fmAh"), cap);
+    draw_txt(x, y, 18, C_LGRAY, cbuf);
+}
+
+// 放电续航估算（仅未插电时显示）：
+//   E剩 [Wh] = 容量mAh/1000 × 3.7V × SOC/100
+//              容量 = batt_log 库仑计数自学习值（默认种子 3000mAh）
+//   P均 [W]  = 近 1 分钟输出功率均值（batt_log 5s/样本，插电时也在积累，
+//              所以拔线 5 秒内就有首个估算值，随样本增多收敛）
+//   t   [h]  = E剩 / P均
+static void draw_runtime_estimate(int x, int y, int soc)
+{
+    char ebuf[96];
+    float avg_w = 0;
+    int n = batt_log_avg_discharge_w(60, &avg_w);
+    if (n >= 1 && avg_w > 0.05f && soc > 0) {
+        float cap_mah = batt_log_capacity_mah();
+        float e_wh = cap_mah / 1000.0f * BOARD_BATT_NOMINAL_V * soc / 100.0f;
+        float t_h = e_wh / avg_w;
+        if (t_h > 99.0f) t_h = 99.0f;
+        if (t_h < 1.0f)
+            snprintf(ebuf, sizeof(ebuf),
+                     tr("EST. %d MIN LEFT (AVG %.2fW)",
+                        "预计续航 %d 分钟（近1分钟均 %.2fW）"),
+                     (int)(t_h * 60.0f), avg_w);
+        else
+            snprintf(ebuf, sizeof(ebuf),
+                     tr("EST. %.1f H LEFT (AVG %.2fW)",
+                        "预计续航 %.1f 小时（近1分钟均 %.2fW）"),
+                     t_h, avg_w);
+        draw_txt(x, y, 18, C_LGRAY, ebuf);
+    } else {
+        draw_txt(x, y, 18, C_GRAY,
+                 tr("RUNTIME ESTIMATING...", "续航估算中…"));
+    }
+}
+
 static void draw_page_dash(uint32_t uptime_s)
 {
     char buf[64];
@@ -421,7 +471,9 @@ static void draw_page_dash(uint32_t uptime_s)
     if (!s_ctx.stc3117 || stc3117_read(s_ctx.stc3117, &stc_v, &stc_soc) != ESP_OK) stc_soc = -1;
 
     // ---- 电池卡片 ----
-    int soc = cw_soc >= 0 ? cw_soc : (int)stc_soc;   // 主 SOC 优先 CW2015
+    // 主 SOC 用 STC3117（带 10mΩ 采样电阻的库仑计）；CW2015 纯电压估计，
+    // 仅作回退/参考，后续板子可能不贴（2026-08-21 用户定）
+    int soc = stc_soc >= 0 ? (int)(stc_soc + 0.5f) : cw_soc;
     uint16_t soc_col = soc < 0   ? C_GRAY
                      : soc < 15  ? C_RED
                      : soc < 40  ? C_YELL : C_GREEN;
@@ -444,42 +496,48 @@ static void draw_page_dash(uint32_t uptime_s)
         fb_draw_text(490, CONTENT_Y + 55, buf, 6, C_WHITE);
         snprintf(buf, sizeof(buf), "%+.0f mA  %.2f W", vbat_a * 1000.0f, vbat_v * vbat_a);
         draw_txt(490, CONTENT_Y + 120, 30, C_LGRAY, buf);
-        // 三态供电判定（2026-08-16 用户口径）：
-        //   1. VBUS < 4.0V（未插电源）  → 正在放电（黄）
-        //   2. 插电且电池不再净放电      → 正在充电（绿）
-        //   3. 插电但电池仍净放电        → 供电不足（红）——5V 输入到顶也
-        //      喂不饱整机，电池在补差额（实测 VBUS 4.7~5.0V 随线长变化，
-        //      判"插电"用 4.0V 阈值；正电流=放电，INA219 IN+=VBAT）
+        // 供电判定（2026-08-21 用户口径，不再有红色）：
+        //   1. VBUS < 4.0V（未插电源）→ 正在放电（黄）+ 续航估算
+        //   2. 插电且 输入功率 ≥ 输出功率 → USB 供电中（绿）
+        //      （电池快满时充电电流收尾，输入略大于输出是正常收敛，不是异常）
+        //   3. 插电但 输入功率 < 输出功率 → 供电可能不足（黄），电池在补差额
+        //   输入 = U20(VBUS INA219)，输出 = U4(VBAT INA219)，均 10mΩ 精测
         bool plugged = vbus_ok && vbus_v > 4.0f;
-        float p_bat = vbat_v * vbat_a;   // 正 = 电池净放电功率
+        float p_out = vbat_v * vbat_a;                     // U4：输出侧功率
+        float p_in  = vbus_ok ? vbus_v * vbus_a : 0.0f;    // U20：USB 输入功率
         if (!plugged) {
-            draw_txt(490, CONTENT_Y + 165, 34, C_YELL, tr("DISCHARGING", "正在放电"));
-        } else if (p_bat > 0.15f) {
-            draw_txt(490, CONTENT_Y + 160, 34, C_RED,
-                     tr("POWER DEFICIT!", "供电不足！"));
-            snprintf(buf, sizeof(buf),
-                     tr("PLUGGED IN, BATTERY STILL DRAINS %.1fW (INPUT MAXED)",
-                        "已插电但电池仍在放 %.1fW，输入已到上限"),
-                     p_bat);
-            draw_txt(490, CONTENT_Y + 202, 20, C_RED, buf);
+            draw_txt(490, CONTENT_Y + 160, 34, C_YELL, tr("DISCHARGING", "正在放电"));
+            draw_runtime_estimate(490, CONTENT_Y + 198, soc);
+            draw_capacity_line(490, CONTENT_Y + 222, soc);
+        } else if (p_in >= p_out) {
+            draw_txt(490, CONTENT_Y + 160, 34, C_GREEN,
+                     tr("USB POWERED", "USB 供电中"));
+            draw_capacity_line(490, CONTENT_Y + 202, soc);
         } else {
-            draw_txt(490, CONTENT_Y + 165, 34, C_GREEN, tr("CHARGING", "正在充电"));
+            draw_txt(490, CONTENT_Y + 160, 34, C_YELL,
+                     tr("POWER MAY BE LOW", "供电可能不足"));
+            snprintf(buf, sizeof(buf),
+                     tr("IN %.2fW < OUT %.2fW, BATTERY FILLS THE GAP",
+                        "输入 %.2fW < 输出 %.2fW，电池在补差额"),
+                     p_in, p_out);
+            draw_txt(490, CONTENT_Y + 198, 18, C_YELL, buf);
+            draw_capacity_line(490, CONTENT_Y + 222, soc);
         }
     } else {
         draw_txt(490, CONTENT_Y + 100, 32, C_RED,
                  tr("INA219 READ FAIL", "INA219 读取失败"));
     }
-    // 两颗电量计交叉读数
+    // 两颗电量计交叉读数：竖排在左列电量条下方，右列让给续航/容量两行
     if (cw_soc >= 0)
         snprintf(buf, sizeof(buf), "CW2015 %.3fV %d%%", cw_v, cw_soc);
     else
         snprintf(buf, sizeof(buf), "CW2015 --");
-    fb_draw_text(80, CONTENT_Y + 222, buf, 2, C_GRAY);
+    fb_draw_text(80, CONTENT_Y + 216, buf, 2, C_GRAY);
     if (stc_soc >= 0)
         snprintf(buf, sizeof(buf), "STC3117 %.3fV %.1f%%", stc_v, stc_soc);
     else
         snprintf(buf, sizeof(buf), "STC3117 --");
-    fb_draw_text(490, CONTENT_Y + 222, buf, 2, C_GRAY);
+    fb_draw_text(80, CONTENT_Y + 234, buf, 2, C_GRAY);
 
     // ---- USB 供电卡片 ----
     ui_card(40, CONTENT_Y + 270, 944, 120, C_CYAN, tr("USB POWER", "USB 供电"));

@@ -60,6 +60,13 @@
 #define INA219_VBAT_ADDR   0x40  // U4: IN+=VBAT, IN-=VBAT_LOAD
 #define INA219_VBUS_ADDR   0x41  // U20: IN+=VBUS_RAW, IN-=VBUS_LOAD
 
+// ---- 电池容量（放电续航估算用）----
+// 这里只是**默认种子**：batt_log 的库仑计数自学习会在放电中估出真实容量并
+// 存 NVS（"batt"/"cap_mah"），之后以学习值为准（见 batt_log.c）。
+// STC3117 的容量是要写进 CC_CNF 的输入参数，不是测量结果。
+#define BOARD_BATT_CAPACITY_MAH  3000
+#define BOARD_BATT_NOMINAL_V     3.7f
+
 // ---- 面板时序（与 Pi 端 DPI overlay 完全一致：1144×803 总幅面）----
 #define LCD_H_RES          1024
 #define LCD_V_RES          768

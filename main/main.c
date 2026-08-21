@@ -844,8 +844,8 @@ void app_main(void)
         ESP_LOGE(TAG, "VSYNC 探测启动失败（不影响其余功能）");
     }
 
-    // 电池历史采样（INA219 VBAT + CW2015 常连总线，谁持屏都在跑）
-    batt_log_start(s_ina_vbat, s_cw2015);
+    // 电池历史采样（INA219 常连总线；STC3117 主 SOC 走 MUX，Pi 持屏时自动回退）
+    batt_log_start(s_ina_vbat, s_ina_vbus, s_stc3117, s_cw2015);
 
     // 显式开 ES8389 模拟电源：DAC_3V3_EN(P1_0) 推挽驱高（R84 上拉对 U31 不够稳）
     aw9523_update_bits(s_aw9523, AW9523_REG_OUTPUT_P1, AW9523_P1_DAC_3V3_EN, AW9523_P1_DAC_3V3_EN);
