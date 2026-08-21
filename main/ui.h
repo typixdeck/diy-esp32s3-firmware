@@ -49,3 +49,12 @@ void ui_maybe_flush(void);
 
 // ---- 耳机插拔抢屏页 ----
 void ui_draw_hp_page(int raw, float rms_l, float rms_r);
+
+// ---- 调试：帧缓冲只读指针（CDC SCREENSHOT 回传用），未初始化返回 NULL ----
+const uint16_t *ui_framebuffer(void);
+// 帧快照（与整页重绘互斥，不会拷到半张画面）；dst 需容纳 1024*768*2 字节
+bool ui_snapshot(uint16_t *dst);
+
+// ---- 调试：远程切主题/切页（CDC THEME_n / TAB_n），下次重绘时生效 ----
+void ui_request_theme(int t);
+void ui_request_tab(int t);

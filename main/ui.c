@@ -6,6 +6,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -144,10 +145,78 @@ static void fb_draw_text_centered(int y, const char *text, int scale, uint16_t c
 }
 
 // ---------------------------------------------------------------------------
-// 语言（默认英文，设置页可切中文，NVS 持久化：namespace "ui" / key "lang"）
+// 语言 + 主题（设置页可切换，NVS 持久化：namespace "ui" / key "lang"/"theme"）
 // ---------------------------------------------------------------------------
 typedef enum { LANG_EN = 0, LANG_ZH = 1 } ui_lang_t;
 static ui_lang_t s_lang = LANG_EN;
+
+typedef enum {
+    TH_CYBER = 0,     // V1 赛博朋克 HUD：霓虹青描边 + 切角边框
+    TH_MINIMAL,       // V2 极简暗色：大圆角卡片 + 薄荷绿强调
+    TH_TERMINAL,      // V3 复古琥珀终端：单色 + 像素字
+    TH_EV,            // V4 EV 仪表：大圆环电量表
+    TH_COUNT,
+} ui_theme_t;
+static ui_theme_t s_theme = TH_CYBER;
+
+// RGB888 → RGB565（编译期常量友好）
+#define RGB(r, g, b) (uint16_t)((((r) >> 3) << 11) | (((g) >> 2) << 5) | ((b) >> 3))
+
+typedef struct {
+    uint16_t bg;          // 页面背景
+    uint16_t card;        // 卡片底
+    uint16_t card2;       // 卡片内元素底（chip/进度条槽）
+    uint16_t frame;       // 卡片描边
+    uint16_t text;        // 主文本
+    uint16_t text2;       // 次级文本
+    uint16_t dim;         // 弱文本
+    uint16_t accent;      // 主题强调色
+    uint16_t accent2;     // 副强调色（FPS 芯片等）
+    uint16_t good, warn, bad;
+    uint16_t tabbar;      // Tab 栏底
+    uint16_t tab_sel_bg, tab_sel_fg, tab_fg;
+} theme_pal_t;
+
+static const theme_pal_t k_pal[TH_COUNT] = {
+    [TH_CYBER] = {
+        .bg = RGB(5, 10, 18),      .card = RGB(8, 16, 28),   .card2 = RGB(13, 26, 44),
+        .frame = RGB(0, 110, 140), .text = RGB(230, 245, 255),
+        .text2 = RGB(150, 180, 200), .dim = RGB(90, 110, 130),
+        .accent = RGB(0, 229, 255), .accent2 = RGB(255, 45, 120),
+        .good = RGB(0, 255, 106),  .warn = RGB(255, 210, 77), .bad = RGB(255, 59, 59),
+        .tabbar = RGB(4, 12, 20),  .tab_sel_bg = RGB(10, 32, 46),
+        .tab_sel_fg = RGB(0, 229, 255), .tab_fg = RGB(120, 150, 170),
+    },
+    [TH_MINIMAL] = {
+        .bg = RGB(17, 20, 23),     .card = RGB(28, 33, 39),  .card2 = RGB(40, 47, 55),
+        .frame = RGB(45, 53, 62),  .text = RGB(242, 245, 247),
+        .text2 = RGB(170, 180, 189), .dim = RGB(107, 117, 126),
+        .accent = RGB(61, 220, 151), .accent2 = RGB(61, 220, 151),
+        .good = RGB(61, 220, 151), .warn = RGB(230, 162, 60), .bad = RGB(224, 90, 90),
+        .tabbar = RGB(28, 33, 39), .tab_sel_bg = RGB(61, 220, 151),
+        .tab_sel_fg = RGB(10, 16, 13), .tab_fg = RGB(170, 180, 189),
+    },
+    [TH_TERMINAL] = {
+        .bg = RGB(0, 0, 0),        .card = RGB(0, 0, 0),     .card2 = RGB(30, 19, 0),
+        .frame = RGB(255, 176, 0), .text = RGB(255, 176, 0),
+        .text2 = RGB(192, 128, 0), .dim = RGB(122, 85, 0),
+        .accent = RGB(255, 176, 0), .accent2 = RGB(255, 176, 0),
+        .good = RGB(255, 176, 0),  .warn = RGB(255, 220, 90), .bad = RGB(255, 80, 0),
+        .tabbar = RGB(0, 0, 0),    .tab_sel_bg = RGB(255, 176, 0),
+        .tab_sel_fg = RGB(0, 0, 0), .tab_fg = RGB(192, 128, 0),
+    },
+    [TH_EV] = {
+        .bg = RGB(0, 0, 0),        .card = RGB(20, 24, 29),  .card2 = RGB(30, 36, 43),
+        .frame = RGB(42, 49, 57),  .text = RGB(240, 244, 248),
+        .text2 = RGB(185, 194, 204), .dim = RGB(102, 112, 122),
+        .accent = RGB(46, 139, 255), .accent2 = RGB(46, 229, 107),
+        .good = RGB(46, 229, 107), .warn = RGB(255, 214, 10), .bad = RGB(255, 69, 58),
+        .tabbar = RGB(0, 0, 0),    .tab_sel_bg = RGB(0, 0, 0),
+        .tab_sel_fg = RGB(240, 244, 248), .tab_fg = RGB(140, 150, 160),
+    },
+};
+
+static inline const theme_pal_t *pal(void) { return &k_pal[s_theme]; }
 
 // 双语取词：中文需要 TTF；font 分区没刷时强制回英文（中文会画成空白）
 static const char *tr(const char *en, const char *zh)
@@ -155,7 +224,7 @@ static const char *tr(const char *en, const char *zh)
     return (s_lang == LANG_ZH && ttf_font_ready()) ? zh : en;
 }
 
-static void lang_load(void)
+static void prefs_load(void)
 {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -163,7 +232,7 @@ static void lang_load(void)
         err = nvs_flash_init();
     }
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "NVS 不可用（%s），语言设置不持久", esp_err_to_name(err));
+        ESP_LOGW(TAG, "NVS 不可用（%s），语言/主题设置不持久", esp_err_to_name(err));
         return;
     }
     nvs_handle_t h;
@@ -172,19 +241,29 @@ static void lang_load(void)
         if (nvs_get_u8(h, "lang", &v) == ESP_OK && v <= LANG_ZH) {
             s_lang = (ui_lang_t)v;
         }
+        if (nvs_get_u8(h, "theme", &v) == ESP_OK && v < TH_COUNT) {
+            s_theme = (ui_theme_t)v;
+        }
         nvs_close(h);
     }
-    ESP_LOGI(TAG, "UI 语言：%s", s_lang == LANG_ZH ? "中文" : "English");
+    ESP_LOGI(TAG, "UI 语言：%s 主题：%d", s_lang == LANG_ZH ? "中文" : "English", s_theme);
 }
 
-static void lang_save(void)
+static void prefs_save(void)
 {
     nvs_handle_t h;
     if (nvs_open("ui", NVS_READWRITE, &h) != ESP_OK) return;
     nvs_set_u8(h, "lang", (uint8_t)s_lang);
+    nvs_set_u8(h, "theme", (uint8_t)s_theme);
     nvs_commit(h);
     nvs_close(h);
 }
+
+// 远程调试（CDC THEME_n / TAB_n 命令）：跨任务只置请求，UI 重绘时消费，
+// 避免 cdc_stats_task 直接画帧缓冲与 GUI 任务打架
+static volatile int s_req_theme = -1, s_req_tab = -1;
+void ui_request_theme(int t) { if (t >= 0 && t < TH_COUNT) s_req_theme = t; }
+void ui_request_tab(int t)   { if (t >= 0 && t < UI_TAB_COUNT) s_req_tab = t; }
 
 // ---------------------------------------------------------------------------
 // TTF 优先的文本绘制（阿里巴巴普惠体，中英混排）。TTF 未就绪（font 分区没刷）
@@ -228,11 +307,122 @@ static void fb_draw_line(int x0, int y0, int x1, int y1, int thick, uint16_t col
     }
 }
 
+// ---------------------------------------------------------------------------
+// 主题化绘制原语
+// ---------------------------------------------------------------------------
+// 圆角矩形填充：角行按圆方程收缩（每行两次浮点 sqrt，只有 2r 行，代价可忽略）
+static void fb_fill_round_rect(int x, int y, int w, int h, int r, uint16_t color)
+{
+    if (r <= 0) { fb_fill_rect(x, y, w, h, color); return; }
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+    for (int dy = 0; dy < h; dy++) {
+        int inset = 0;
+        if (dy < r) {
+            float t = (float)(r - dy);
+            inset = r - (int)(sqrtf((float)r * r - t * t) + 0.5f);
+        } else if (dy >= h - r) {
+            float t = (float)(dy - (h - 1 - r));
+            inset = r - (int)(sqrtf((float)r * r - t * t) + 0.5f);
+        }
+        fb_fill_rect(x + inset, y + dy, w - 2 * inset, 1, color);
+    }
+}
+
+// 圆角矩形描边卡片：先描边色填底，再内缩 bw 填卡片色（微量过绘，代码最短）
+static void fb_round_card(int x, int y, int w, int h, int r, int bw,
+                          uint16_t border, uint16_t fill)
+{
+    fb_fill_round_rect(x, y, w, h, r, border);
+    fb_fill_round_rect(x + bw, y + bw, w - 2 * bw, h - 2 * bw,
+                       r > bw ? r - bw : 0, fill);
+}
+
+// 1px 矩形描边（终端主题边框）
+static void fb_rect_outline(int x, int y, int w, int h, int t, uint16_t color)
+{
+    fb_fill_rect(x, y, w, t, color);
+    fb_fill_rect(x, y + h - t, w, t, color);
+    fb_fill_rect(x, y, t, h, color);
+    fb_fill_rect(x + w - t, y, t, h, color);
+}
+
+// 赛博主题四角亮角标（L 形，臂长 len 粗 t）
+static void fb_corner_brackets(int x, int y, int w, int h, int len, int t,
+                               uint16_t color)
+{
+    fb_fill_rect(x, y, len, t, color);             fb_fill_rect(x, y, t, len, color);
+    fb_fill_rect(x + w - len, y, len, t, color);   fb_fill_rect(x + w - t, y, t, len, color);
+    fb_fill_rect(x, y + h - t, len, t, color);     fb_fill_rect(x, y + h - len, t, len, color);
+    fb_fill_rect(x + w - len, y + h - t, len, t, color);
+    fb_fill_rect(x + w - t, y + h - len, t, len, color);
+}
+
+// 分段电量条（赛博/终端主题）：nseg 段，2px 间隙
+static void fb_segment_bar(int x, int y, int w, int h, int nseg, int pct,
+                           uint16_t on, uint16_t off)
+{
+    int seg_w = (w - (nseg - 1) * 3) / nseg;
+    int lit = (pct * nseg + 50) / 100;
+    for (int i = 0; i < nseg; i++) {
+        fb_fill_rect(x + i * (seg_w + 3), y, seg_w, h, i < lit ? on : off);
+    }
+}
+
+// EV 主题圆环电量表：圆心 (cx,cy)，外/内半径，pct 0..100，从正上方顺时针。
+// 颜色沿弧度青→绿渐变；只扫环带 bounding box，环外像素零成本跳过。
+static void fb_ring_gauge(int cx, int cy, int r_out, int r_in, int pct,
+                          uint16_t track)
+{
+    float fill_end = (float)pct / 100.0f * 2.0f * (float)M_PI;
+    int r_out2 = r_out * r_out, r_in2 = r_in * r_in;
+    for (int y = -r_out; y <= r_out; y++) {
+        int fy = cy + y;
+        if (fy < 0 || fy >= LCD_V_RES) continue;
+        uint16_t *row = s_fb + fy * LCD_H_RES;
+        for (int x = -r_out; x <= r_out; x++) {
+            int fx = cx + x;
+            if (fx < 0 || fx >= LCD_H_RES) continue;
+            int d2 = x * x + y * y;
+            if (d2 > r_out2 || d2 < r_in2) continue;
+            // atan2 以正上方为 0、顺时针增长
+            float a = atan2f((float)x, (float)-y);
+            if (a < 0) a += 2.0f * (float)M_PI;
+            if (a <= fill_end && pct > 0) {
+                float f = a / (2.0f * (float)M_PI);   // 0..1 沿弧渐变
+                int rr = 0;
+                int gg = 200 + (int)(55 * f);
+                int bb = 180 - (int)(140 * f);
+                row[fx] = RGB(rr, gg, bb);
+            } else {
+                row[fx] = track;
+            }
+        }
+    }
+}
+
 static void fb_flush(void)
 {
     if (s_panel && s_fb) {
         esp_lcd_panel_draw_bitmap(s_panel, 0, 0, LCD_H_RES, LCD_V_RES, s_fb);
     }
+}
+
+const uint16_t *ui_framebuffer(void)
+{
+    return s_fb;
+}
+
+// 截图快照：与整页重绘互斥，避免 CDC 任务在 GUI 画到一半时拷走撕裂帧
+static SemaphoreHandle_t s_draw_mtx;
+
+bool ui_snapshot(uint16_t *dst)
+{
+    if (!s_fb || !dst) return false;
+    if (s_draw_mtx) xSemaphoreTake(s_draw_mtx, portMAX_DELAY);
+    memcpy(dst, s_fb, (size_t)LCD_H_RES * LCD_V_RES * 2);
+    if (s_draw_mtx) xSemaphoreGive(s_draw_mtx);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +443,8 @@ esp_err_t ui_init(esp_lcd_panel_handle_t panel, const ui_ctx_t *ctx)
     if (ferr != ESP_OK) {
         ESP_LOGW(TAG, "TTF 字体不可用（%s），中文将无法显示", esp_err_to_name(ferr));
     }
-    lang_load();   // NVS 里的语言偏好（默认英文）
+    prefs_load();   // NVS 里的语言/主题偏好
+    if (!s_draw_mtx) s_draw_mtx = xSemaphoreCreateMutex();
     return ESP_OK;
 }
 
@@ -328,46 +519,135 @@ ui_tab_t ui_current_tab(void)
     return s_tab;
 }
 
-// 右上角 Pi 信号状态芯片（所有页共用）
+// 右上角 Pi 信号状态芯片（所有页共用，按主题上色）
 static void draw_status_chip(void)
 {
-    int x = UI_TAB_COUNT * TAB_W + 8, w = LCD_H_RES - x - 8;
-    fb_fill_rect(x, 8, w, TAB_BAR_H - 16, C_BLACK);
+    const theme_pal_t *p = pal();
+    int x = UI_TAB_COUNT * TAB_W + 10, w = LCD_H_RES - x - 10;
     char buf[24];
     float fps = vsync_mon_fps();
-    if (fps > 0) {
+    bool sig = fps > 0;
+    uint16_t fg = sig ? (s_theme == TH_CYBER ? p->accent2 : p->good) : p->bad;
+
+    switch (s_theme) {
+    case TH_CYBER:
+        fb_fill_rect(x, 10, w, TAB_BAR_H - 20, p->bg);
+        fb_rect_outline(x, 10, w, TAB_BAR_H - 20, 2, fg);
+        break;
+    case TH_MINIMAL:
+        fb_fill_round_rect(x, 12, w, TAB_BAR_H - 24, 12, p->card2);
+        break;
+    default:   // TERMINAL / EV：无框，纯文字
+        fb_fill_rect(x, 8, w, TAB_BAR_H - 16, p->tabbar);
+        break;
+    }
+    if (sig) {
         snprintf(buf, sizeof(buf), "PI %d.%d", (int)fps, (int)(fps * 10) % 10);
-        fb_draw_text(x + 16, 14, buf, 3, C_GREEN);
-        draw_txt(x + 16, 42, 24, C_DGREEN, tr("FPS LIVE", "FPS 实时"));
+        if (s_theme == TH_TERMINAL) {
+            fb_draw_text(x + 14, 16, buf, 3, fg);
+            fb_draw_text(x + 14, 48, "FPS", 2, p->text2);
+        } else {
+            draw_txt(x + 14, 10, 28, fg, buf);
+            draw_txt(x + 14, 42, 18, p->dim, tr("FPS LIVE", "FPS 实时"));
+        }
     } else {
-        fb_draw_text(x + 16, 14, "PI RGB", 3, C_RED);
-        draw_txt(x + 16, 42, 24, C_RED, tr("NO SIGNAL", "无信号"));
+        if (s_theme == TH_TERMINAL) {
+            fb_draw_text(x + 14, 16, "PI RGB", 3, fg);
+            fb_draw_text(x + 14, 48, "NO SIG", 2, p->text2);
+        } else {
+            draw_txt(x + 14, 10, 28, fg, "PI RGB");
+            draw_txt(x + 14, 42, 18, fg, tr("NO SIGNAL", "无信号"));
+        }
     }
 }
 
 static void draw_tab_bar(void)
 {
-    fb_fill_rect(0, 0, LCD_H_RES, TAB_BAR_H, C_NAVY);
+    const theme_pal_t *p = pal();
+    fb_fill_rect(0, 0, LCD_H_RES, TAB_BAR_H, p->tabbar);
+
     for (int i = 0; i < UI_TAB_COUNT; i++) {
         int x = i * TAB_W;
-        if ((ui_tab_t)i == s_tab) {
-            fb_fill_rect(x, 0, TAB_W, TAB_BAR_H, C_DARK);
-            fb_fill_rect(x, TAB_BAR_H - 8, TAB_W, 8, C_CYAN);
-        }
-        uint16_t col = ((ui_tab_t)i == s_tab) ? C_WHITE : C_GRAY;
+        bool sel = ((ui_tab_t)i == s_tab);
         const char *name = tr(k_tab_en[i], k_tab_zh[i]);
-        draw_txt(x + (TAB_W - txt_w(28, name)) / 2, 24, 28, col, name);
+        int tw = txt_w(26, name);
+
+        switch (s_theme) {
+        case TH_CYBER:
+            if (sel) {
+                fb_fill_rect(x + 4, 8, TAB_W - 8, TAB_BAR_H - 16, p->tab_sel_bg);
+                fb_rect_outline(x + 4, 8, TAB_W - 8, TAB_BAR_H - 16, 2, p->accent);
+                fb_fill_rect(x + 10, TAB_BAR_H - 8, TAB_W - 20, 4, p->accent);
+            } else {
+                fb_rect_outline(x + 4, 8, TAB_W - 8, TAB_BAR_H - 16, 1, p->frame);
+            }
+            draw_txt(x + (TAB_W - tw) / 2, 24, 26,
+                     sel ? p->tab_sel_fg : p->tab_fg, name);
+            break;
+        case TH_MINIMAL:
+            if (sel) {
+                fb_fill_round_rect(x + 6, 10, TAB_W - 12, TAB_BAR_H - 20,
+                                   (TAB_BAR_H - 20) / 2, p->tab_sel_bg);
+            }
+            draw_txt(x + (TAB_W - tw) / 2, 24, 26,
+                     sel ? p->tab_sel_fg : p->tab_fg, name);
+            break;
+        case TH_TERMINAL: {
+            // [标签] 文本式 tab，选中反白
+            if (sel) fb_fill_rect(x + 4, 14, TAB_W - 8, TAB_BAR_H - 28, p->tab_sel_bg);
+            uint16_t fg = sel ? p->tab_sel_fg : p->tab_fg;
+            draw_txt(x + (TAB_W - tw) / 2, 24, 26, fg, name);
+            if (!sel) {
+                draw_txt(x + 6, 24, 26, p->dim, "[");
+                draw_txt(x + TAB_W - 20, 24, 26, p->dim, "]");
+            }
+            break;
+        }
+        case TH_EV:
+        default:
+            draw_txt(x + (TAB_W - tw) / 2, 22, 26,
+                     sel ? p->tab_sel_fg : p->tab_fg, name);
+            if (sel) fb_fill_rect(x + 24, TAB_BAR_H - 8, TAB_W - 48, 5, p->accent);
+            break;
+        }
     }
-    fb_fill_rect(0, TAB_BAR_H, LCD_H_RES, 4, C_GREEN);
+    // 底部分隔线（极简主题不要，卡片自身有留白）
+    if (s_theme == TH_CYBER)    fb_fill_rect(0, TAB_BAR_H - 2, LCD_H_RES, 2, p->frame);
+    if (s_theme == TH_TERMINAL) fb_fill_rect(0, TAB_BAR_H - 2, LCD_H_RES, 2, p->frame);
+    if (s_theme == TH_EV)       fb_fill_rect(0, TAB_BAR_H - 1, LCD_H_RES, 1, p->frame);
     draw_status_chip();
 }
 
-// 卡片：深黑底 + 左侧彩色竖条 + 标题
+// 主题化卡片容器 + 标题
 static void ui_card(int x, int y, int w, int h, uint16_t accent, const char *title)
 {
-    fb_fill_rect(x, y, w, h, C_BLACK);
-    fb_fill_rect(x, y, 8, h, accent);
-    draw_txt(x + 30, y + 12, 26, accent, title);
+    const theme_pal_t *p = pal();
+    switch (s_theme) {
+    case TH_CYBER:
+        fb_fill_rect(x, y, w, h, p->card);
+        fb_rect_outline(x, y, w, h, 1, p->frame);
+        fb_corner_brackets(x, y, w, h, 26, 3, p->accent);
+        draw_txt(x + 26, y + 14, 26, p->accent, title);
+        break;
+    case TH_MINIMAL:
+        fb_fill_round_rect(x, y, w, h, 22, p->card);
+        draw_txt(x + 28, y + 16, 26, p->text2, title);
+        break;
+    case TH_TERMINAL: {
+        fb_rect_outline(x, y, w, h, 2, p->frame);
+        // 标题嵌在上边框：先用背景挖槽再写字
+        int tw = txt_w(26, title);
+        fb_fill_rect(x + (w - tw) / 2 - 14, y - 2, tw + 28, 6, p->bg);
+        draw_txt(x + (w - tw) / 2, y - 14, 26, p->text, title);
+        break;
+    }
+    case TH_EV:
+    default:
+        fb_fill_round_rect(x, y, w, h, 14, p->card);
+        draw_txt(x + 24, y + 12, 24, p->text2, title);
+        break;
+    }
+    (void)accent;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,13 +696,13 @@ static void draw_capacity_line(int x, int y, int soc)
     float cap = batt_log_capacity_mah();
     if (soc > 0)
         snprintf(cbuf, sizeof(cbuf),
-                 tr("EST. TOTAL %.0fmAh, %.0fmAh LEFT",
-                    "估算总容量 %.0fmAh，剩余 %.0fmAh"),
+                 tr("TOTAL %.0fmAh / LEFT %.0fmAh",
+                    "总容量 %.0fmAh，剩余 %.0fmAh"),
                  cap, cap * soc / 100.0f);
     else
         snprintf(cbuf, sizeof(cbuf),
-                 tr("EST. TOTAL %.0fmAh", "估算总容量 %.0fmAh"), cap);
-    draw_txt(x, y, 18, C_LGRAY, cbuf);
+                 tr("TOTAL %.0fmAh (EST.)", "估算总容量 %.0fmAh"), cap);
+    draw_txt(x, y, 18, pal()->text2, cbuf);
 }
 
 // 放电续航估算（仅未插电时显示）：
@@ -444,134 +724,291 @@ static void draw_runtime_estimate(int x, int y, int soc)
         if (t_h < 1.0f)
             snprintf(ebuf, sizeof(ebuf),
                      tr("EST. %d MIN LEFT (AVG %.2fW)",
-                        "预计续航 %d 分钟（近1分钟均 %.2fW）"),
+                        "预计续航 %d 分钟（均 %.2fW）"),
                      (int)(t_h * 60.0f), avg_w);
         else
             snprintf(ebuf, sizeof(ebuf),
                      tr("EST. %.1f H LEFT (AVG %.2fW)",
-                        "预计续航 %.1f 小时（近1分钟均 %.2fW）"),
+                        "预计续航 %.1f 小时（均 %.2fW）"),
                      t_h, avg_w);
-        draw_txt(x, y, 18, C_LGRAY, ebuf);
+        draw_txt(x, y, 18, pal()->text2, ebuf);
     } else {
-        draw_txt(x, y, 18, C_GRAY,
+        draw_txt(x, y, 18, pal()->dim,
                  tr("RUNTIME ESTIMATING...", "续航估算中…"));
     }
 }
 
-static void draw_page_dash(uint32_t uptime_s)
-{
-    char buf[64];
-    float vbat_v = 0, vbat_a = 0, vbus_v = 0, vbus_a = 0;
-    float cw_v = 0, stc_v = 0, stc_soc = -1;
-    int cw_soc = -1;
-    bool vbat_ok = s_ctx.ina_vbat && ina219_read(s_ctx.ina_vbat, &vbat_v, &vbat_a) == ESP_OK;
-    bool vbus_ok = s_ctx.ina_vbus && ina219_read(s_ctx.ina_vbus, &vbus_v, &vbus_a) == ESP_OK;
-    if (!s_ctx.cw2015 || cw2015_read(s_ctx.cw2015, &cw_v, &cw_soc) != ESP_OK) cw_soc = -1;
-    stc3117_ensure_running(s_ctx.stc3117);   // 兜底：POR/BATFAIL 后重新拉起 GG_RUN
-    if (!s_ctx.stc3117 || stc3117_read(s_ctx.stc3117, &stc_v, &stc_soc) != ESP_OK) stc_soc = -1;
+// dash 页共享的一次采样
+typedef struct {
+    float vbat_v, vbat_a, vbus_v, vbus_a, cw_v, stc_v, stc_soc;
+    int cw_soc, soc;
+    bool vbat_ok, vbus_ok, plugged;
+    uint16_t soc_col;
+} dash_data_t;
 
-    // ---- 电池卡片 ----
-    // 主 SOC 用 STC3117（带 10mΩ 采样电阻的库仑计）；CW2015 纯电压估计，
-    // 仅作回退/参考，后续板子可能不贴（2026-08-21 用户定）
-    int soc = stc_soc >= 0 ? (int)(stc_soc + 0.5f) : cw_soc;
-    uint16_t soc_col = soc < 0   ? C_GRAY
-                     : soc < 15  ? C_RED
-                     : soc < 40  ? C_YELL : C_GREEN;
-    ui_card(40, CONTENT_Y + 10, 944, 240, C_YELL, tr("BATTERY", "电池"));
-    if (soc >= 0) {
-        snprintf(buf, sizeof(buf), "%d%%", soc);
-        fb_draw_text(80, CONTENT_Y + 60, buf, 11, soc_col);
+static void dash_read(dash_data_t *d)
+{
+    const theme_pal_t *p = pal();
+    memset(d, 0, sizeof(*d));
+    d->stc_soc = -1;
+    d->cw_soc = -1;
+    d->vbat_ok = s_ctx.ina_vbat &&
+                 ina219_read(s_ctx.ina_vbat, &d->vbat_v, &d->vbat_a) == ESP_OK;
+    d->vbus_ok = s_ctx.ina_vbus &&
+                 ina219_read(s_ctx.ina_vbus, &d->vbus_v, &d->vbus_a) == ESP_OK;
+    if (!s_ctx.cw2015 || cw2015_read(s_ctx.cw2015, &d->cw_v, &d->cw_soc) != ESP_OK)
+        d->cw_soc = -1;
+    stc3117_ensure_running(s_ctx.stc3117);
+    if (!s_ctx.stc3117 || stc3117_read(s_ctx.stc3117, &d->stc_v, &d->stc_soc) != ESP_OK)
+        d->stc_soc = -1;
+    // 主 SOC 用 STC3117（带采样电阻库仑计），CW2015 仅回退
+    d->soc = d->stc_soc >= 0 ? (int)(d->stc_soc + 0.5f) : d->cw_soc;
+    d->plugged = d->vbus_ok && d->vbus_v > 4.0f;
+    d->soc_col = d->soc < 0  ? p->dim
+               : d->soc < 15 ? p->bad
+               : d->soc < 40 ? p->warn : p->good;
+}
+
+// 供电状态三态文案 + 续航/容量行（x 为左缘，y0 为状态行顶）。
+// 判定口径（2026-08-21 用户定，无红色状态）：
+//   未插电 → 正在放电 + 续航估算；插电且 P_in≥P_out → USB 供电中（绿）；
+//   插电但 P_in<P_out → 供电可能不足（黄），电池在补差额
+static void dash_power_status(const dash_data_t *d, int x, int y0)
+{
+    const theme_pal_t *p = pal();
+    char buf[96];
+    float p_out = d->vbat_v * d->vbat_a;
+    float p_in  = d->vbus_ok ? d->vbus_v * d->vbus_a : 0.0f;
+    if (!d->plugged) {
+        draw_txt(x, y0, 32, p->warn, tr("DISCHARGING", "正在放电"));
+        draw_runtime_estimate(x, y0 + 44, d->soc);
+        draw_capacity_line(x, y0 + 70, d->soc);
+    } else if (p_in >= p_out) {
+        draw_txt(x, y0, 32, p->good, tr("USB POWERED", "USB 供电中"));
+        draw_capacity_line(x, y0 + 44, d->soc);
     } else {
-        fb_draw_text(80, CONTENT_Y + 80, "--%", 9, C_GRAY);
+        draw_txt(x, y0, 32, p->warn, tr("POWER MAY BE LOW", "供电可能不足"));
+        snprintf(buf, sizeof(buf),
+                 tr("IN %.2fW < OUT %.2fW, BATT FILLS GAP",
+                    "输入 %.2fW < 输出 %.2fW，电池在补差额"),
+                 p_in, p_out);
+        draw_txt(x, y0 + 44, 18, p->warn, buf);
+        draw_capacity_line(x, y0 + 70, d->soc);
     }
-    // 电量条
-    {
-        int bx = 80, by = CONTENT_Y + 170, bw = 320, bh = 40;
-        fb_fill_rect(bx - 3, by - 3, bw + 6, bh + 6, C_LGRAY);
-        fb_fill_rect(bx, by, bw, bh, C_DARK);
-        if (soc > 0) fb_fill_rect(bx, by, bw * soc / 100, bh, soc_col);
-    }
-    if (vbat_ok) {
-        snprintf(buf, sizeof(buf), "%.3f V", vbat_v);
-        fb_draw_text(490, CONTENT_Y + 55, buf, 6, C_WHITE);
-        snprintf(buf, sizeof(buf), "%+.0f mA  %.2f W", vbat_a * 1000.0f, vbat_v * vbat_a);
-        draw_txt(490, CONTENT_Y + 120, 30, C_LGRAY, buf);
-        // 供电判定（2026-08-21 用户口径，不再有红色）：
-        //   1. VBUS < 4.0V（未插电源）→ 正在放电（黄）+ 续航估算
-        //   2. 插电且 输入功率 ≥ 输出功率 → USB 供电中（绿）
-        //      （电池快满时充电电流收尾，输入略大于输出是正常收敛，不是异常）
-        //   3. 插电但 输入功率 < 输出功率 → 供电可能不足（黄），电池在补差额
-        //   输入 = U20(VBUS INA219)，输出 = U4(VBAT INA219)，均 10mΩ 精测
-        bool plugged = vbus_ok && vbus_v > 4.0f;
-        float p_out = vbat_v * vbat_a;                     // U4：输出侧功率
-        float p_in  = vbus_ok ? vbus_v * vbus_a : 0.0f;    // U20：USB 输入功率
-        if (!plugged) {
-            draw_txt(490, CONTENT_Y + 160, 34, C_YELL, tr("DISCHARGING", "正在放电"));
-            draw_runtime_estimate(490, CONTENT_Y + 198, soc);
-            draw_capacity_line(490, CONTENT_Y + 222, soc);
-        } else if (p_in >= p_out) {
-            draw_txt(490, CONTENT_Y + 160, 34, C_GREEN,
-                     tr("USB POWERED", "USB 供电中"));
-            draw_capacity_line(490, CONTENT_Y + 202, soc);
-        } else {
-            draw_txt(490, CONTENT_Y + 160, 34, C_YELL,
-                     tr("POWER MAY BE LOW", "供电可能不足"));
-            snprintf(buf, sizeof(buf),
-                     tr("IN %.2fW < OUT %.2fW, BATTERY FILLS THE GAP",
-                        "输入 %.2fW < 输出 %.2fW，电池在补差额"),
-                     p_in, p_out);
-            draw_txt(490, CONTENT_Y + 198, 18, C_YELL, buf);
-            draw_capacity_line(490, CONTENT_Y + 222, soc);
-        }
-    } else {
-        draw_txt(490, CONTENT_Y + 100, 32, C_RED,
-                 tr("INA219 READ FAIL", "INA219 读取失败"));
-    }
-    // 两颗电量计交叉读数：竖排在左列电量条下方，右列让给续航/容量两行
-    if (cw_soc >= 0)
-        snprintf(buf, sizeof(buf), "CW2015 %.3fV %d%%", cw_v, cw_soc);
+}
+
+// 两颗电量计交叉读数小字
+static void dash_gauge_footnotes(const dash_data_t *d, int x, int y, int dy)
+{
+    const theme_pal_t *p = pal();
+    char buf[48];
+    if (d->cw_soc >= 0)
+        snprintf(buf, sizeof(buf), "CW2015 %.3fV %d%%", d->cw_v, d->cw_soc);
     else
         snprintf(buf, sizeof(buf), "CW2015 --");
-    fb_draw_text(80, CONTENT_Y + 216, buf, 2, C_GRAY);
-    if (stc_soc >= 0)
-        snprintf(buf, sizeof(buf), "STC3117 %.3fV %.1f%%", stc_v, stc_soc);
+    fb_draw_text(x, y, buf, 2, p->dim);
+    if (d->stc_soc >= 0)
+        snprintf(buf, sizeof(buf), "STC3117 %.3fV %.1f%%", d->stc_v, d->stc_soc);
     else
         snprintf(buf, sizeof(buf), "STC3117 --");
-    fb_draw_text(80, CONTENT_Y + 234, buf, 2, C_GRAY);
+    fb_draw_text(x, y + dy, buf, 2, p->dim);
+}
 
-    // ---- USB 供电卡片 ----
-    ui_card(40, CONTENT_Y + 270, 944, 120, C_CYAN, tr("USB POWER", "USB 供电"));
-    if (vbus_ok) {
-        snprintf(buf, sizeof(buf), "%.3f V", vbus_v);
-        fb_draw_text(80, CONTENT_Y + 320, buf, 5, C_WHITE);
-        snprintf(buf, sizeof(buf), "%.0f mA", vbus_a * 1000.0f);
-        draw_txt(430, CONTENT_Y + 318, 36, C_LGRAY, buf);
-        snprintf(buf, sizeof(buf), "%.2f W", vbus_v * vbus_a);
-        draw_txt(720, CONTENT_Y + 318, 36, C_LGRAY, buf);
-    } else {
-        draw_txt(80, CONTENT_Y + 318, 32, C_RED,
-                 tr("INA219 READ FAIL", "INA219 读取失败"));
-    }
-
-    // ---- 传感器在位卡片 ----
-    sensors_probe_maybe();
-    snprintf(buf, sizeof(buf), tr("SENSORS %d/%d", "传感器在位 %d/%d"),
-             s_present_ok, (int)N_SENSORS);
-    ui_card(40, CONTENT_Y + 410, 944, 130, C_GREEN, buf);
-    for (int i = 0; i < N_SENSORS; i++) {
-        int col = i % 5, row = i / 5;
-        int x = 80 + col * 182, y = CONTENT_Y + 460 + row * 40;
-        fb_fill_rect(x, y + 2, 12, 12, s_present[i] ? C_GREEN : C_RED);
-        fb_draw_text(x + 24, y, k_sensors[i].name, 2,
-                     s_present[i] ? C_LGRAY : C_GRAY);
-    }
-
-    // ---- 底部 ----
+static void dash_footer(uint32_t uptime_s)
+{
+    const theme_pal_t *p = pal();
+    char buf[96];
     snprintf(buf, sizeof(buf),
              tr("UP %lu S · PRESS □ TO RETURN TO PI",
                 "已运行 %lu 秒 · 按 □ 键返回树莓派画面"),
              (unsigned long)uptime_s);
-    draw_txt_centered(726, 28, C_YELL, buf);
+    draw_txt_centered(726, 24, s_theme == TH_TERMINAL ? p->text2 : p->dim, buf);
+}
+
+// 传感器在位 chip（按主题上壳）
+static void dash_sensor_chip(int x, int y, int w, int h, int i)
+{
+    const theme_pal_t *p = pal();
+    bool ok = s_present[i];
+    uint16_t dot = ok ? p->good : p->bad;
+    switch (s_theme) {
+    case TH_CYBER:
+        fb_fill_rect(x, y, w, h, p->card2);
+        fb_rect_outline(x, y, w, h, 1, p->frame);
+        break;
+    case TH_MINIMAL:
+        fb_fill_round_rect(x, y, w, h, 10, p->card2);
+        break;
+    default:
+        break;   // 终端/EV：无底
+    }
+    fb_fill_rect(x + 16, y + (h - 12) / 2, 12, 12, dot);
+    if (s_theme == TH_MINIMAL)
+        draw_txt(x + 42, y + (h - 26) / 2, 20, ok ? p->text2 : p->dim,
+                 k_sensors[i].name);
+    else
+        fb_draw_text(x + 42, y + (h - 14) / 2, k_sensors[i].name, 2,
+                     ok ? p->text2 : p->dim);
+}
+
+// ---- 卡片式 dash（赛博 / 极简 / 终端三主题共用几何）----
+static void draw_page_dash_cards(const dash_data_t *d, uint32_t uptime_s)
+{
+    const theme_pal_t *p = pal();
+    char buf[64];
+    bool term = (s_theme == TH_TERMINAL);
+
+    // ---- 电池卡片（左 2/3）----
+    int bx = 24, by = CONTENT_Y, bw2 = 648, bh2 = 330;
+    ui_card(bx, by, bw2, bh2, p->warn, tr("BATTERY", "电池"));
+    if (d->soc >= 0) {
+        snprintf(buf, sizeof(buf), "%d%%", d->soc);
+        if (term) fb_draw_text(bx + 36, by + 62, buf, 12, d->soc_col);
+        else      draw_txt(bx + 36, by + 44, 110, d->soc_col, buf);
+    } else {
+        if (term) fb_draw_text(bx + 36, by + 62, "--%", 12, p->dim);
+        else      draw_txt(bx + 36, by + 44, 110, p->dim, "--%");
+    }
+    // 电量条
+    {
+        int gx = bx + 36, gy = by + 196, gw = 300, gh = 32;
+        int pct = d->soc > 0 ? d->soc : 0;
+        if (s_theme == TH_MINIMAL) {
+            fb_fill_round_rect(gx, gy + 6, gw, 18, 9, p->card2);
+            if (pct > 0)
+                fb_fill_round_rect(gx, gy + 6, gw * pct / 100, 18, 9, p->accent);
+        } else {
+            fb_segment_bar(gx, gy, gw, gh, 15, pct, d->soc_col, p->card2);
+            if (s_theme == TH_CYBER)
+                fb_rect_outline(gx - 4, gy - 4, gw + 8, gh + 8, 1, p->frame);
+        }
+    }
+    dash_gauge_footnotes(d, bx + 36, by + 252, 20);
+
+    int rx = bx + 360;
+    if (d->vbat_ok) {
+        snprintf(buf, sizeof(buf), "%.3f V", d->vbat_v);
+        if (term) fb_draw_text(rx, by + 48, buf, 5, p->text);
+        else      draw_txt(rx, by + 40, 48, p->text, buf);
+        snprintf(buf, sizeof(buf), "%+.0f mA · %.2f W", d->vbat_a * 1000.0f,
+                 d->vbat_v * d->vbat_a);
+        draw_txt(rx, by + 108, 26, p->text2, buf);
+        dash_power_status(d, rx, by + 150);
+    } else {
+        draw_txt(rx, by + 100, 30, p->bad, tr("INA219 READ FAIL", "INA219 读取失败"));
+    }
+
+    // ---- USB 供电卡片（右 1/3）----
+    int ux = 688, uy = CONTENT_Y, uw = 312, uh = 330;
+    ui_card(ux, uy, uw, uh, p->accent, tr("USB POWER", "USB 供电"));
+    if (d->vbus_ok) {
+        snprintf(buf, sizeof(buf), "%.3f V", d->vbus_v);
+        if (term) fb_draw_text(ux + 28, uy + 64, buf, 5, p->text);
+        else      draw_txt(ux + 28, uy + 56, 46, p->text, buf);
+        snprintf(buf, sizeof(buf), "%.0f mA", d->vbus_a * 1000.0f);
+        draw_txt(ux + 28, uy + 136, 30, p->text2, buf);
+        snprintf(buf, sizeof(buf), "%.2f W", d->vbus_v * d->vbus_a);
+        draw_txt(ux + 28, uy + 182, 30, p->text2, buf);
+        const char *st = d->plugged ? tr("CONNECTED", "已连接")
+                                    : tr("UNPLUGGED", "未连接");
+        uint16_t sc = d->plugged ? p->good : p->dim;
+        if (s_theme == TH_MINIMAL) {
+            int tw = txt_w(20, st);
+            fb_fill_round_rect(ux + 28, uy + 244, tw + 32, 40, 10, p->card2);
+            draw_txt(ux + 44, uy + 252, 20, sc, st);
+        } else {
+            draw_txt(ux + 28, uy + 248, 24, sc, st);
+        }
+    } else {
+        draw_txt(ux + 28, uy + 100, 26, p->bad, tr("READ FAIL", "读取失败"));
+    }
+
+    // ---- 传感器在位卡片（底部全宽）----
+    snprintf(buf, sizeof(buf), tr("SENSORS %d/%d", "传感器在位 %d/%d"),
+             s_present_ok, (int)N_SENSORS);
+    ui_card(24, CONTENT_Y + 346, 976, 214, p->good, buf);
+    for (int i = 0; i < (int)N_SENSORS; i++) {
+        int col = i % 5, row = i / 5;
+        dash_sensor_chip(41 + col * 190, CONTENT_Y + 346 + 52 + row * 76,
+                         182, 62, i);
+    }
+    dash_footer(uptime_s);
+}
+
+// ---- EV 仪表 dash（大圆环）----
+static void draw_page_dash_ev(const dash_data_t *d, uint32_t uptime_s)
+{
+    const theme_pal_t *p = pal();
+    char buf[64];
+
+    // 左：圆环电量表
+    int cx = 250, cy = 350;
+    fb_ring_gauge(cx, cy, 165, 127, d->soc > 0 ? d->soc : 0, p->card2);
+    {
+        const char *t = tr("BATTERY", "电池");
+        draw_txt(cx - txt_w(26, t) / 2, cy - 108, 26, p->text2, t);
+        if (d->soc >= 0) snprintf(buf, sizeof(buf), "%d%%", d->soc);
+        else             snprintf(buf, sizeof(buf), "--%%");
+        draw_txt(cx - txt_w(88, buf) / 2, cy - 62, 88, p->text, buf);
+        if (d->vbat_ok) {
+            snprintf(buf, sizeof(buf), "%.3f V", d->vbat_v);
+            draw_txt(cx - txt_w(30, buf) / 2, cy + 46, 30, p->text2, buf);
+        }
+    }
+
+    // 右列读数
+    int rx = 520;
+    if (d->vbat_ok) {
+        snprintf(buf, sizeof(buf), "%+.0f mA", d->vbat_a * 1000.0f);
+        draw_txt(rx, 110, 54, p->text, buf);
+        fb_fill_rect(rx, 182, 460, 1, p->frame);
+        snprintf(buf, sizeof(buf), "%.2f W", d->vbat_v * d->vbat_a);
+        draw_txt(rx, 196, 54, p->text, buf);
+        fb_fill_rect(rx, 268, 460, 1, p->frame);
+        dash_power_status(d, rx, 284);
+        dash_gauge_footnotes(d, rx, 396, 18);
+    } else {
+        draw_txt(rx, 140, 30, p->bad, tr("INA219 READ FAIL", "INA219 读取失败"));
+    }
+
+    // USB 供电条状模块
+    {
+        int ux = rx, uy = 440, uw = 460, uh = 80;
+        fb_fill_round_rect(ux, uy, uw, uh, 12, p->card);
+        draw_txt(ux + 20, uy + 10, 22, p->text2, tr("USB POWER", "USB 供电"));
+        if (d->vbus_ok) {
+            snprintf(buf, sizeof(buf), "%.3f V · %.0f mA · %.2f W",
+                     d->vbus_v, d->vbus_a * 1000.0f, d->vbus_v * d->vbus_a);
+            draw_txt(ux + 20, uy + 42, 22, p->dim, buf);
+        }
+        const char *st = d->plugged ? tr("CONNECTED", "已连接")
+                                    : tr("UNPLUGGED", "未连接");
+        draw_txt(ux + uw - txt_w(22, st) - 20, uy + 28, 22,
+                 d->plugged ? p->good : p->dim, st);
+    }
+
+    // 底部 telltale 传感器块
+    snprintf(buf, sizeof(buf), tr("SENSORS %d/%d", "传感器在位 %d/%d"),
+             s_present_ok, (int)N_SENSORS);
+    draw_txt(36, 548, 20, p->dim, buf);
+    for (int i = 0; i < (int)N_SENSORS; i++) {
+        int x = 36 + i * 96, y = 580;
+        bool ok = s_present[i];
+        fb_fill_round_rect(x, y, 88, 66, 10, p->card);
+        fb_rect_outline(x, y, 88, 66, 1, ok ? p->frame : p->bad);
+        fb_fill_rect(x + 38, y + 44, 12, 12, ok ? p->good : p->bad);
+        fb_draw_text(x + 8, y + 14, k_sensors[i].name, 1, ok ? p->text2 : p->bad);
+    }
+    dash_footer(uptime_s);
+}
+
+static void draw_page_dash(uint32_t uptime_s)
+{
+    dash_data_t d;
+    dash_read(&d);
+    sensors_probe_maybe();
+    if (s_theme == TH_EV) draw_page_dash_ev(&d, uptime_s);
+    else                  draw_page_dash_cards(&d, uptime_s);
 }
 
 // ---------------------------------------------------------------------------
@@ -599,16 +1036,17 @@ static void draw_page_batt(void)
     int n = batt_log_get(s_graph_buf, BATT_LOG_CAP);
 
     // 图框 + 网格（25% 步进横线，15 分钟竖线）
-    fb_fill_rect(GRAPH_X - 4, GRAPH_Y - 4, GRAPH_W + 8, GRAPH_H + 8, C_LGRAY);
-    fb_fill_rect(GRAPH_X, GRAPH_Y, GRAPH_W, GRAPH_H, C_BLACK);
+    const theme_pal_t *p = pal();
+    fb_fill_rect(GRAPH_X - 2, GRAPH_Y - 2, GRAPH_W + 4, GRAPH_H + 4, p->frame);
+    fb_fill_rect(GRAPH_X, GRAPH_Y, GRAPH_W, GRAPH_H, s_theme == TH_MINIMAL ? p->card : C_BLACK);
     for (int i = 1; i < 4; i++) {
-        fb_fill_rect(GRAPH_X, GRAPH_Y + GRAPH_H * i / 4, GRAPH_W, 1, C_DARK);
-        fb_fill_rect(GRAPH_X + GRAPH_W * i / 4, GRAPH_Y, 1, GRAPH_H, C_DARK);
+        fb_fill_rect(GRAPH_X, GRAPH_Y + GRAPH_H * i / 4, GRAPH_W, 1, p->card2);
+        fb_fill_rect(GRAPH_X + GRAPH_W * i / 4, GRAPH_Y, 1, GRAPH_H, p->card2);
     }
     // 纵轴标注（SOC 尺度）
-    fb_draw_text(GRAPH_X - 60, GRAPH_Y - 8, "100", 2, C_DGREEN);
-    fb_draw_text(GRAPH_X - 60, GRAPH_Y + GRAPH_H / 2 - 8, "50", 2, C_DGREEN);
-    fb_draw_text(GRAPH_X - 48, GRAPH_Y + GRAPH_H - 8, "0", 2, C_DGREEN);
+    fb_draw_text(GRAPH_X - 60, GRAPH_Y - 8, "100", 2, p->dim);
+    fb_draw_text(GRAPH_X - 60, GRAPH_Y + GRAPH_H / 2 - 8, "50", 2, p->dim);
+    fb_draw_text(GRAPH_X - 48, GRAPH_Y + GRAPH_H - 8, "0", 2, p->dim);
 
     if (n >= 2) {
         // x 轴固定 1 小时窗口（720 槽），数据不足时靠右对齐（最新在最右）
@@ -618,30 +1056,30 @@ static void draw_page_batt(void)
             const batt_sample_t *a = &s_graph_buf[i - 1], *b = &s_graph_buf[i];
             if (a->soc >= 0 && b->soc >= 0) {
                 fb_draw_line(x0, graph_map(a->soc, 0, 100),
-                             x1, graph_map(b->soc, 0, 100), 3, C_GREEN);
+                             x1, graph_map(b->soc, 0, 100), 3, p->good);
             }
             if (a->mv && b->mv) {
                 fb_draw_line(x0, graph_map(a->mv, 3000, 4400),
-                             x1, graph_map(b->mv, 3000, 4400), 2, C_CYAN);
+                             x1, graph_map(b->mv, 3000, 4400), 2, p->accent);
                 fb_draw_line(x0, graph_map(a->ma, -2000, 2000),
-                             x1, graph_map(b->ma, -2000, 2000), 2, C_YELL);
+                             x1, graph_map(b->ma, -2000, 2000), 2, p->warn);
             }
         }
     } else {
-        draw_txt_centered(GRAPH_Y + GRAPH_H / 2 - 20, 36, C_GRAY,
+        draw_txt_centered(GRAPH_Y + GRAPH_H / 2 - 20, 36, p->dim,
                           tr("COLLECTING DATA...", "正在采集数据……"));
     }
 
     // 图例 + 最新读数
     int ly = GRAPH_Y + GRAPH_H + 30;
-    fb_fill_rect(GRAPH_X, ly + 4, 24, 12, C_GREEN);
-    fb_draw_text(GRAPH_X + 36, ly, "SOC 0-100%", 2, C_LGRAY);
-    fb_fill_rect(GRAPH_X + 240, ly + 4, 24, 12, C_CYAN);
-    fb_draw_text(GRAPH_X + 276, ly, "V 3.0-4.4", 2, C_LGRAY);
-    fb_fill_rect(GRAPH_X + 460, ly + 4, 24, 12, C_YELL);
-    fb_draw_text(GRAPH_X + 496, ly, "MA -2000..2000", 2, C_LGRAY);
+    fb_fill_rect(GRAPH_X, ly + 4, 24, 12, p->good);
+    fb_draw_text(GRAPH_X + 36, ly, "SOC 0-100%", 2, p->text2);
+    fb_fill_rect(GRAPH_X + 240, ly + 4, 24, 12, p->accent);
+    fb_draw_text(GRAPH_X + 276, ly, "V 3.0-4.4", 2, p->text2);
+    fb_fill_rect(GRAPH_X + 460, ly + 4, 24, 12, p->warn);
+    fb_draw_text(GRAPH_X + 496, ly, "MA -2000..2000", 2, p->text2);
     snprintf(buf, sizeof(buf), tr("%d/%d SAMPLES", "%d/%d 采样"), n, BATT_LOG_CAP);
-    draw_txt(GRAPH_X + 740, ly - 4, 22, C_GRAY, buf);
+    draw_txt(GRAPH_X + 740, ly - 4, 22, p->dim, buf);
 
     if (n > 0) {
         const batt_sample_t *last = &s_graph_buf[n - 1];
@@ -653,9 +1091,9 @@ static void draw_page_batt(void)
             snprintf(buf, sizeof(buf), tr("NOW: --%%  %d.%03dV  %+dmA",
                                           "当前: --%%  %d.%03dV  %+dmA"),
                      last->mv / 1000, last->mv % 1000, last->ma);
-        draw_txt(GRAPH_X, ly + 40, 34, C_WHITE, buf);
+        draw_txt(GRAPH_X, ly + 40, 34, p->text, buf);
     }
-    draw_txt_centered(726, 26, C_GRAY,
+    draw_txt_centered(726, 26, p->dim,
                       tr("1 HOUR WINDOW / 5S STEP", "1 小时窗口 / 5 秒步进"));
 }
 
@@ -689,8 +1127,9 @@ static uint16_t trail_color(int i)
 
 static void draw_touch_coords(void)
 {
+    const theme_pal_t *p = pal();
     char buf[48];
-    fb_fill_rect(40, 692, 760, 40, C_DARK);
+    fb_fill_rect(40, 692, 760, 40, p->card);
     if (s_touch_last_x >= 0) {
         snprintf(buf, sizeof(buf), tr("X:%4d Y:%4d  EVENTS:%lu",
                                       "X:%4d Y:%4d  事件:%lu"),
@@ -700,25 +1139,30 @@ static void draw_touch_coords(void)
                                       "触摸画布试试  事件:%lu"),
                  (unsigned long)s_touch_events);
     }
-    draw_txt(48, 696, 28, C_WHITE, buf);
+    draw_txt(48, 696, 28, p->text, buf);
 }
 
 static void draw_page_touch(void)
 {
-    draw_txt(CANVAS_X, CONTENT_Y, 28, C_CYAN,
+    const theme_pal_t *p = pal();
+    draw_txt(CANVAS_X, CONTENT_Y, 28, p->accent,
              tr("GT911 TOUCH TEST - DRAW ON CANVAS", "GT911 触摸测试——在画布上绘制"));
     // 画布
-    fb_fill_rect(CANVAS_X - 4, CANVAS_Y - 4, CANVAS_W + 8, CANVAS_H + 8, C_LGRAY);
+    fb_fill_rect(CANVAS_X - 2, CANVAS_Y - 2, CANVAS_W + 4, CANVAS_H + 4, p->frame);
     fb_fill_rect(CANVAS_X, CANVAS_Y, CANVAS_W, CANVAS_H, C_BLACK);
     // 重放轨迹
     for (int i = 0; i < s_trail_n; i++) {
         fb_fill_rect(s_trail_x[i], s_trail_y[i], 8, 8, trail_color(i));
     }
     // CLEAR 按钮
-    fb_fill_rect(CLEAR_X, CLEAR_Y, CLEAR_W, CLEAR_H, C_NAVY);
-    fb_fill_rect(CLEAR_X, CLEAR_Y, CLEAR_W, 4, C_CYAN);
+    if (s_theme == TH_MINIMAL) {
+        fb_fill_round_rect(CLEAR_X, CLEAR_Y, CLEAR_W, CLEAR_H, 16, p->card2);
+    } else {
+        fb_fill_rect(CLEAR_X, CLEAR_Y, CLEAR_W, CLEAR_H, p->card2);
+        fb_rect_outline(CLEAR_X, CLEAR_Y, CLEAR_W, CLEAR_H, 2, p->accent);
+    }
     const char *clr = tr("CLEAR", "清除");
-    draw_txt(CLEAR_X + (CLEAR_W - txt_w(32, clr)) / 2, CLEAR_Y + 16, 32, C_WHITE, clr);
+    draw_txt(CLEAR_X + (CLEAR_W - txt_w(32, clr)) / 2, CLEAR_Y + 14, 32, p->text, clr);
     draw_touch_coords();
 }
 
@@ -727,81 +1171,131 @@ static void draw_page_touch(void)
 // ---------------------------------------------------------------------------
 static void draw_page_pisig(void)
 {
+    const theme_pal_t *p = pal();
     char buf[64];
     bool sig = vsync_mon_signal();
     float fps = vsync_mon_fps();
 
     if (sig) {
-        draw_txt_centered(CONTENT_Y + 30, 64, C_GREEN, tr("SIGNAL", "有信号"));
+        draw_txt_centered(CONTENT_Y + 30, 64, p->good, tr("SIGNAL", "有信号"));
         snprintf(buf, sizeof(buf), "%d.%d", (int)fps, (int)(fps * 10) % 10);
-        fb_draw_text_centered(CONTENT_Y + 160, buf, 18, C_WHITE);
-        draw_txt_centered(CONTENT_Y + 320, 44, C_LGRAY,
+        fb_draw_text_centered(CONTENT_Y + 160, buf, 18, p->text);
+        draw_txt_centered(CONTENT_Y + 320, 44, p->text2,
                           vsync_mon_locked()
                               ? tr("FPS (FROZEN, PROBE OFF)", "FPS（冻结值，探测已关）")
                               : tr("FPS (DPI REFRESH RATE)", "FPS（DPI 刷新率）"));
     } else {
-        draw_txt_centered(CONTENT_Y + 30, 64, C_RED, tr("NO SIGNAL", "无信号"));
-        draw_txt_centered(CONTENT_Y + 190, 36, C_GRAY,
+        draw_txt_centered(CONTENT_Y + 30, 64, p->bad, tr("NO SIGNAL", "无信号"));
+        draw_txt_centered(CONTENT_Y + 190, 36, p->dim,
                           tr("PI RGB OUTPUT NOT DETECTED", "未检测到树莓派 RGB 输出"));
     }
 
     int y = CONTENT_Y + 420;
     snprintf(buf, sizeof(buf), tr("FRAMES: %lu", "帧计数: %lu"),
              (unsigned long)vsync_mon_frames());
-    draw_txt(80, y, 28, C_LGRAY, buf);
+    draw_txt(80, y, 28, p->text2, buf);
     int64_t age = vsync_mon_age_ms();
     if (age >= 0)
         snprintf(buf, sizeof(buf), tr("LAST VSYNC: %lld MS AGO",
                                       "上次 VSYNC: %lld 毫秒前"), (long long)age);
     else
         snprintf(buf, sizeof(buf), "%s", tr("LAST VSYNC: NEVER", "上次 VSYNC: 从未"));
-    draw_txt(80, y + 44, 28, C_LGRAY, buf);
+    draw_txt(80, y + 44, 28, p->text2, buf);
     snprintf(buf, sizeof(buf), tr("INT STORMS: %lu", "中断风暴: %lu"),
              (unsigned long)vsync_mon_storms());
-    draw_txt(80, y + 88, 28, C_LGRAY, buf);
+    draw_txt(80, y + 88, 28, p->text2, buf);
 
-    draw_txt(80, y + 150, 22, C_GRAY,
+    draw_txt(80, y + 150, 22, p->dim,
              tr("SENSE PATH: PI GPIO2 (DPI VSYNC) - R83 -",
                 "探测链路: Pi GPIO2 (DPI VSYNC) → R83 →"));
-    draw_txt(80, y + 180, 22, C_GRAY,
+    draw_txt(80, y + 180, 22, p->dim,
              tr("AW9523 P0_7 INT - GPIO5 EDGE COUNT",
                 "AW9523 P0_7 中断 → GPIO5 沿计数"));
-    draw_txt_centered(726, 28, C_YELL,
+    draw_txt_centered(726, 28, p->dim,
                       tr("PRESS □ TO RETURN TO PI", "按 □ 键返回树莓派画面"));
 }
 
 // ---------------------------------------------------------------------------
-// 设置页：语言切换（触摸两个大按钮，选中即写 NVS）
+// 设置页：语言 + 主题（触摸即切换并写 NVS）
 // ---------------------------------------------------------------------------
 #define LBTN_W    360
-#define LBTN_H    120
-#define LBTN_Y    (CONTENT_Y + 170)
-#define LBTN_EN_X 120
-#define LBTN_ZH_X 544
+#define LBTN_H    100
+#define LBTN_Y    (CONTENT_Y + 78)
+#define LBTN_EN_X 60
+#define LBTN_ZH_X 460
+
+#define TBTN_W    218
+#define TBTN_H    170
+#define TBTN_Y    (CONTENT_Y + 330)
+#define TBTN_X0   60
+#define TBTN_DX   232
+
+static const char *k_theme_en[TH_COUNT] = { "CYBER", "MINIMAL", "TERMINAL", "EV RING" };
+static const char *k_theme_zh[TH_COUNT] = { "赛博",   "极简",     "终端",     "EV 仪表" };
+
+// 每个主题按钮里画一小块风格预览色板
+static void draw_theme_swatch(int x, int y, int w, int h, ui_theme_t t)
+{
+    const theme_pal_t *q = &k_pal[t];
+    fb_fill_rect(x, y, w, h, q->bg);
+    fb_rect_outline(x, y, w, h, 1, q->frame);
+    fb_fill_rect(x + 8, y + 8, w - 16, 10, q->accent);
+    fb_fill_rect(x + 8, y + 24, (w - 16) * 2 / 3, 8, q->good);
+    fb_fill_rect(x + 8, y + 38, (w - 16) / 2, 8, q->text2);
+}
 
 static void draw_page_setup(void)
 {
-    draw_txt(60, CONTENT_Y + 20, 36, C_CYAN, tr("Language 语言", "语言 Language"));
-    draw_txt(60, CONTENT_Y + 84, 24, C_GRAY,
-             tr("Touch to switch. Saved to flash (NVS).",
-                "触摸切换，选择会写入 Flash（NVS）持久保存"));
+    const theme_pal_t *p = pal();
+    draw_txt(60, CONTENT_Y + 14, 32, p->accent, tr("Language 语言", "语言 Language"));
 
     for (int i = 0; i < 2; i++) {
         int x = (i == 0) ? LBTN_EN_X : LBTN_ZH_X;
         bool sel = (s_lang == ((i == 0) ? LANG_EN : LANG_ZH));
-        fb_fill_rect(x - 5, LBTN_Y - 5, LBTN_W + 10, LBTN_H + 10,
-                     sel ? C_CYAN : C_LGRAY);
-        fb_fill_rect(x, LBTN_Y, LBTN_W, LBTN_H, sel ? C_NAVY : C_BLACK);
+        if (s_theme == TH_MINIMAL) {
+            fb_fill_round_rect(x, LBTN_Y, LBTN_W, LBTN_H, 18,
+                               sel ? p->tab_sel_bg : p->card);
+        } else {
+            fb_fill_rect(x, LBTN_Y, LBTN_W, LBTN_H, sel ? p->card2 : p->card);
+            fb_rect_outline(x, LBTN_Y, LBTN_W, LBTN_H, sel ? 3 : 1,
+                            sel ? p->accent : p->frame);
+        }
         const char *label = (i == 0) ? "English" : "中文";
-        draw_txt(x + (LBTN_W - txt_w(44, label)) / 2, LBTN_Y + 36, 44,
-                 sel ? C_WHITE : C_GRAY, label);
+        uint16_t fg = (s_theme == TH_MINIMAL && sel) ? p->tab_sel_fg
+                    : sel ? p->text : p->dim;
+        draw_txt(x + (LBTN_W - txt_w(40, label)) / 2, LBTN_Y + 28, 40, fg, label);
+    }
+
+    draw_txt(60, CONTENT_Y + 230, 32, p->accent, tr("Theme 主题", "主题 Theme"));
+    draw_txt(60, CONTENT_Y + 278, 22, p->dim,
+             tr("Touch to switch. Saved to flash (NVS).",
+                "触摸切换，写入 Flash（NVS）持久保存"));
+
+    for (int i = 0; i < TH_COUNT; i++) {
+        int x = TBTN_X0 + i * TBTN_DX;
+        bool sel = ((ui_theme_t)i == s_theme);
+        if (s_theme == TH_MINIMAL) {
+            fb_fill_round_rect(x, TBTN_Y, TBTN_W, TBTN_H, 18, p->card);
+            if (sel) fb_rect_outline(x, TBTN_Y, TBTN_W, TBTN_H, 3, p->accent);
+        } else {
+            fb_fill_rect(x, TBTN_Y, TBTN_W, TBTN_H, p->card);
+            fb_rect_outline(x, TBTN_Y, TBTN_W, TBTN_H, sel ? 3 : 1,
+                            sel ? p->accent : p->frame);
+        }
+        draw_theme_swatch(x + 16, TBTN_Y + 16, TBTN_W - 32, 56, (ui_theme_t)i);
+        const char *name = tr(k_theme_en[i], k_theme_zh[i]);
+        draw_txt(x + (TBTN_W - txt_w(26, name)) / 2, TBTN_Y + 96, 26,
+                 sel ? p->text : p->text2, name);
+        if (sel)
+            draw_txt(x + (TBTN_W - txt_w(20, "*")) / 2, TBTN_Y + 134, 20,
+                     p->accent, tr("ACTIVE", "当前"));
     }
 
     if (!ttf_font_ready()) {
-        draw_txt(60, LBTN_Y + LBTN_H + 60, 24, C_RED,
+        draw_txt(60, TBTN_Y + TBTN_H + 24, 22, p->bad,
                  "TTF FONT MISSING - CHINESE UNAVAILABLE");
     }
-    draw_txt_centered(726, 28, C_YELL,
+    draw_txt_centered(726, 26, p->dim,
                       tr("PRESS □ TO RETURN TO PI", "按 □ 键返回树莓派画面"));
 }
 
@@ -810,8 +1304,20 @@ static void draw_page_setup(void)
 // ---------------------------------------------------------------------------
 void ui_page_draw(uint32_t uptime_s)
 {
+    // 消费远程调试请求（CDC THEME_n / TAB_n），在 GUI 任务上下文安全生效
+    if (s_req_theme >= 0) {
+        int t = s_req_theme;
+        s_req_theme = -1;
+        if (t != (int)s_theme) { s_theme = (ui_theme_t)t; prefs_save(); }
+    }
+    if (s_req_tab >= 0) {
+        int t = s_req_tab;
+        s_req_tab = -1;
+        s_tab = (ui_tab_t)t;
+    }
     s_last_uptime_s = uptime_s;
-    fb_fill_rect(0, 0, LCD_H_RES, LCD_V_RES, C_DARK);
+    if (s_draw_mtx) xSemaphoreTake(s_draw_mtx, portMAX_DELAY);
+    fb_fill_rect(0, 0, LCD_H_RES, LCD_V_RES, pal()->bg);
     draw_tab_bar();
     switch (s_tab) {
     case UI_TAB_DASH:  draw_page_dash(uptime_s); break;
@@ -821,6 +1327,7 @@ void ui_page_draw(uint32_t uptime_s)
     case UI_TAB_SETUP: draw_page_setup(); break;
     default: break;
     }
+    if (s_draw_mtx) xSemaphoreGive(s_draw_mtx);
     fb_flush();
 }
 
@@ -855,7 +1362,7 @@ void ui_handle_touch(int x, int y, bool pressed)
         return;
     }
 
-    // 设置页：语言按钮（重复点击同一按钮无副作用）
+    // 设置页：语言 / 主题按钮（重复点击同一按钮无副作用）
     if (s_tab == UI_TAB_SETUP) {
         if (y >= LBTN_Y && y < LBTN_Y + LBTN_H) {
             ui_lang_t want;
@@ -864,7 +1371,16 @@ void ui_handle_touch(int x, int y, bool pressed)
             else return;
             if (want != s_lang) {
                 s_lang = want;
-                lang_save();
+                prefs_save();
+                ui_page_draw(s_last_uptime_s);
+            }
+        } else if (y >= TBTN_Y && y < TBTN_Y + TBTN_H) {
+            int idx = (x - TBTN_X0) / TBTN_DX;
+            int off = (x - TBTN_X0) % TBTN_DX;
+            if (x >= TBTN_X0 && idx >= 0 && idx < TH_COUNT && off < TBTN_W &&
+                (ui_theme_t)idx != s_theme) {
+                s_theme = (ui_theme_t)idx;
+                prefs_save();
                 ui_page_draw(s_last_uptime_s);
             }
         }

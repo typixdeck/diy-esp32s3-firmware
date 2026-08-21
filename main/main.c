@@ -456,6 +456,7 @@ static void uac_set_volume_cb(uint32_t volume, void *ctx)
 static volatile bool s_reboot_to_boot = false;   // rx_cb 置位，stats 任务执行
 static volatile bool s_audio_dump = false;       // AUDIO_DUMP：打印功放/耳机/ES8389 寄存器
 static volatile int  s_amp_force = 0;            // AMP_ON=1 / AMP_OFF=-1（诊断用，stats 任务消费后清零）
+static volatile bool s_screenshot = false;       // SCREENSHOT：回传 1024×768 RGB565 帧缓冲
 
 // HP_DET 插拔事件（hp_amp_task 生产，两处消费）：
 //   - cdc_stats_task 打印 "HP_DET changed: x->y"（s_hp_cdc_event 消费后清零）；
@@ -484,6 +485,14 @@ void tud_cdc_rx_cb(uint8_t itf)
                 s_amp_force = 1;
             } else if (pos && strstr(line, "AMP_OFF")) {
                 s_amp_force = -1;
+            } else if (pos && strstr(line, "SCREENSHOT")) {
+                s_screenshot = true;
+            } else if (pos && strstr(line, "THEME_")) {
+                ui_request_theme(strstr(line, "THEME_")[6] - '0');   // 远程验证 UI 用
+            } else if (pos && strstr(line, "TAB_")) {
+                ui_request_tab(strstr(line, "TAB_")[4] - '0');
+            } else if (pos && strstr(line, "TOGGLE_SCREEN")) {
+                s_kbd_toggle_req = true;                             // 等价 □ 键/SW3
             }
             pos = 0;
         } else if (pos < sizeof(line) - 1) {
@@ -524,6 +533,49 @@ static void cdc_audio_dump(void)
     const char *end = "--- END ---\r\n";
     tud_cdc_write(end, strlen(end));
     tud_cdc_write_flush();
+}
+
+// 截图回传：header 行 + "SCRN" 定界符 + 1.5MB 原始 RGB565（小端）。
+// 仅在 cdc_stats_task 上下文调用（流式期间本任务阻塞，天然不会与 1Hz
+// 统计输出交错）。先 memcpy 快照避免 UI 任务重绘造成上下半屏撕裂；
+// PSRAM 不够就直接流原缓冲（撕裂可接受，仅调试用）。
+static void cdc_screenshot(void)
+{
+    const uint16_t *fb = ui_framebuffer();
+    if (!fb) {
+        const char *msg = "\r\n>>> SCREENSHOT: no framebuffer\r\n";
+        tud_cdc_write(msg, strlen(msg));
+        tud_cdc_write_flush();
+        return;
+    }
+    const size_t total = (size_t)LCD_H_RES * LCD_V_RES * 2;
+    uint8_t *snap = heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (snap) ui_snapshot((uint16_t *)snap);   // 与整页重绘互斥，不会撕裂
+    const uint8_t *src = snap ? snap : (const uint8_t *)fb;
+
+    char hdr[80];
+    int n = snprintf(hdr, sizeof(hdr), "\r\n>>> SCREENSHOT %dx%d RGB565LE %u\r\nSCRN",
+                     LCD_H_RES, LCD_V_RES, (unsigned)total);
+    tud_cdc_write(hdr, (uint32_t)n);
+    tud_cdc_write_flush();
+
+    size_t off = 0;
+    TickType_t t0 = xTaskGetTickCount();
+    while (off < total && tud_cdc_connected()) {
+        uint32_t avail = tud_cdc_write_available();
+        if (avail == 0) {
+            tud_cdc_write_flush();
+            vTaskDelay(1);
+            if (xTaskGetTickCount() - t0 > pdMS_TO_TICKS(60000)) break;   // 主机不收，放弃
+            continue;
+        }
+        size_t chunk = avail < total - off ? avail : total - off;
+        tud_cdc_write(src + off, (uint32_t)chunk);
+        tud_cdc_write_flush();
+        off += chunk;
+    }
+    if (snap) free(snap);
+    ESP_LOGI(TAG, "SCREENSHOT 已发送 %u/%u 字节", (unsigned)off, (unsigned)total);
 }
 
 // 独立任务：唯一允许调 tud_cdc_write 的地方
@@ -572,6 +624,10 @@ static void cdc_stats_task(void *arg)
         if (s_audio_dump) {
             s_audio_dump = false;
             cdc_audio_dump();
+        }
+        if (s_screenshot) {
+            s_screenshot = false;
+            cdc_screenshot();
         }
         if (s_hp_cdc_event) {
             int ev = s_hp_cdc_event;
