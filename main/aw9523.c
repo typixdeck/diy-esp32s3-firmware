@@ -8,6 +8,24 @@
 
 static const char *TAG = "AW9523";
 
+// ---- 开机取证快照（见 aw9523.h 注释）----
+const uint8_t aw9523_snap_regs[AW9523_SNAP_COUNT] = {
+    AW9523_REG_INPUT_P0,  AW9523_REG_INPUT_P1,
+    AW9523_REG_OUTPUT_P0, AW9523_REG_OUTPUT_P1,
+    AW9523_REG_CONFIG_P0, AW9523_REG_CONFIG_P1,
+    AW9523_REG_INT_P0,    AW9523_REG_INT_P1,
+    AW9523_REG_GCR,       AW9523_REG_LEDMODE_P0, AW9523_REG_LEDMODE_P1,
+};
+static uint8_t s_snap[AW9523_SNAP_COUNT];
+static bool    s_snap_valid = false;
+
+bool aw9523_boot_snapshot(uint8_t out[AW9523_SNAP_COUNT])
+{
+    if (!s_snap_valid) return false;
+    for (int i = 0; i < AW9523_SNAP_COUNT; i++) out[i] = s_snap[i];
+    return true;
+}
+
 // INTN 与 LCD CS 共线（R82）：vsync 探测锁定后 INT 必须全屏蔽，
 // 任何"重开 P0_7"的路径（reinit/健康检查）都以此为唯一事实来源。
 uint8_t aw9523_int_p0_expected(void)
@@ -62,6 +80,21 @@ esp_err_t aw9523_init(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t *out_
         return ESP_ERR_INVALID_RESPONSE;
     }
     ESP_LOGI(TAG, "AW9523B OK (ID=0x23 @0x5B)");
+
+    // ---- 取证快照：任何写入之前抢拍现场（寄存器保留上一轮运行态）----
+    s_snap_valid = true;
+    for (int i = 0; i < AW9523_SNAP_COUNT; i++) {
+        if (aw9523_read_reg(dev, aw9523_snap_regs[i], &s_snap[i]) != ESP_OK) {
+            s_snap_valid = false;
+            break;
+        }
+    }
+    if (s_snap_valid) {
+        ESP_LOGI(TAG, "开机快照: IN %02X/%02X OUT %02X/%02X CFG %02X/%02X INT %02X/%02X "
+                      "GCR %02X LED %02X/%02X",
+                 s_snap[0], s_snap[1], s_snap[2], s_snap[3], s_snap[4], s_snap[5],
+                 s_snap[6], s_snap[7], s_snap[8], s_snap[9], s_snap[10]);
+    }
 
     // ---- 配置（不做软复位，避免其它已在用的输出瞬间跳变）----
     // 1. 屏蔽全部中断：INTN 经 R82 搭在 ESP_LCD_CS(GPIO5) 上，绝不能让它拉低

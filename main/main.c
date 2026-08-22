@@ -457,6 +457,7 @@ static volatile bool s_reboot_to_boot = false;   // rx_cb 置位，stats 任务�
 static volatile bool s_audio_dump = false;       // AUDIO_DUMP：打印功放/耳机/ES8389 寄存器
 static volatile int  s_amp_force = 0;            // AMP_ON=1 / AMP_OFF=-1（诊断用，stats 任务消费后清零）
 static volatile bool s_screenshot = false;       // SCREENSHOT：回传 1024×768 RGB565 帧缓冲
+static volatile bool s_aw_dump = false;          // AW_DUMP：AW9523 开机取证快照 + 实时寄存器
 
 // HP_DET 插拔事件（hp_amp_task 生产，两处消费）：
 //   - cdc_stats_task 打印 "HP_DET changed: x->y"（s_hp_cdc_event 消费后清零）；
@@ -481,6 +482,8 @@ void tud_cdc_rx_cb(uint8_t itf)
                 s_reboot_to_boot = true;
             } else if (pos && strstr(line, "AUDIO_DUMP")) {
                 s_audio_dump = true;
+            } else if (pos && strstr(line, "AW_DUMP")) {
+                s_aw_dump = true;
             } else if (pos && strstr(line, "AMP_ON")) {
                 s_amp_force = 1;
             } else if (pos && strstr(line, "AMP_OFF")) {
@@ -529,6 +532,52 @@ static void cdc_audio_dump(void)
             tud_cdc_write(buf, (uint32_t)n);
             tud_cdc_write_flush();
         }
+    }
+    const char *end = "--- END ---\r\n";
+    tud_cdc_write(end, strlen(end));
+    tud_cdc_write_flush();
+}
+
+// AW9523 取证 dump：开机快照（init 首笔写入前抢拍，保留上一轮运行态/ESD 翻位
+// 证据）+ 实时寄存器 + HP_DET 相关位解码。仅在 cdc_stats_task 上下文调用。
+static void cdc_aw_dump(void)
+{
+    static const char *names[AW9523_SNAP_COUNT] = {
+        "INPUT_P0", "INPUT_P1", "OUTPUT_P0", "OUTPUT_P1",
+        "CONFIG_P0", "CONFIG_P1", "INT_P0", "INT_P1",
+        "GCR", "LEDMODE_P0", "LEDMODE_P1",
+    };
+    char buf[160];
+    int n;
+    uint8_t snap[AW9523_SNAP_COUNT];
+    bool have_snap = aw9523_boot_snapshot(snap);
+    n = snprintf(buf, sizeof(buf), "\r\n--- AW_DUMP (boot-snapshot | live) ---\r\n");
+    tud_cdc_write(buf, (uint32_t)n);
+    for (int i = 0; i < AW9523_SNAP_COUNT; i++) {
+        uint8_t live = 0;
+        bool ok = aw9523_read_reg(s_aw9523, aw9523_snap_regs[i], &live) == ESP_OK;
+        if (have_snap && ok)
+            n = snprintf(buf, sizeof(buf), "%-10s [0x%02X]  boot=0x%02X  live=0x%02X%s\r\n",
+                         names[i], aw9523_snap_regs[i], snap[i], live,
+                         snap[i] != live ? "  <— DIFF" : "");
+        else
+            n = snprintf(buf, sizeof(buf), "%-10s [0x%02X]  boot=%s  live=%s\r\n",
+                         names[i], aw9523_snap_regs[i],
+                         have_snap ? "??" : "N/A", ok ? "??" : "READ_FAIL");
+        tud_cdc_write(buf, (uint32_t)n);
+        tud_cdc_write_flush();
+    }
+    // HP_DET(P1_7) 裁决位解码：CONFIG_P1.7 应为 1（输入）；INPUT_P1.7 = 引脚实际电平
+    uint8_t cfg1 = 0, in1 = 0;
+    if (aw9523_read_reg(s_aw9523, AW9523_REG_CONFIG_P1, &cfg1) == ESP_OK &&
+        aw9523_read_reg(s_aw9523, AW9523_REG_INPUT_P1, &in1) == ESP_OK) {
+        n = snprintf(buf, sizeof(buf),
+                     "HP_DET(P1_7): dir=%s level=%d | DAC_3V3_EN(P1_0): dir=%s level=%d\r\n",
+                     (cfg1 & AW9523_P1_HP_DET) ? "IN" : "OUT(!)",
+                     (in1 & AW9523_P1_HP_DET) ? 1 : 0,
+                     (cfg1 & AW9523_P1_DAC_3V3_EN) ? "IN" : "OUT",
+                     (in1 & AW9523_P1_DAC_3V3_EN) ? 1 : 0);
+        tud_cdc_write(buf, (uint32_t)n);
     }
     const char *end = "--- END ---\r\n";
     tud_cdc_write(end, strlen(end));
@@ -624,6 +673,10 @@ static void cdc_stats_task(void *arg)
         if (s_audio_dump) {
             s_audio_dump = false;
             cdc_audio_dump();
+        }
+        if (s_aw_dump) {
+            s_aw_dump = false;
+            cdc_aw_dump();
         }
         if (s_screenshot) {
             s_screenshot = false;

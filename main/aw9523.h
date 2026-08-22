@@ -51,6 +51,15 @@
 #define AW9523_P1_TP_INT      (1 << 6)  // P1_6 (pin16) ← 触摸中断走 MUX（仅复位期间短暂输出低）【输入】
 #define AW9523_P1_HP_DET      (1 << 7)  // P1_7 (pin17) → R86 → HP_DET 耳机检测(CN10.1)【输入】
 
+// 开机取证快照：aw9523_init 在 ID 自检之后、第一笔写入之前抢拍的全寄存器现场。
+// AW9523 不随 ESP 复位——热重启/魔串刷机后寄存器保留上一轮运行态，ESD 翻位
+// 证据可以穿越刷机保留到这里（2026-08-21 HP_DET 幻影插拔取证用）。
+#include <stdbool.h>
+#define AW9523_SNAP_COUNT 11
+extern const uint8_t aw9523_snap_regs[AW9523_SNAP_COUNT];   // 快照覆盖的寄存器地址表
+// 返回 true = 快照有效（init 已跑且逐寄存器读取成功），值按 aw9523_snap_regs 顺序填入
+bool aw9523_boot_snapshot(uint8_t out[AW9523_SNAP_COUNT]);
+
 esp_err_t aw9523_init(i2c_master_bus_handle_t bus, i2c_master_dev_handle_t *out_dev);
 // 运行期自愈重建：芯片被 ESD/毛刺复位（寄存器回默认全输出高）后，按 aw9523_init
 // 同款绝对写入序列重建配置，并把 MUX 恢复到 mux_esp_side。
