@@ -1,5 +1,5 @@
 // HD317001C40 (JD9168S) SPI 初始化
-// 序列 1:1 来自 firmware/cyberfold_esp32s3_fw/main/lcd_init.c
+// 序列 1:1 来自 firmware/typixdeck_esp32s3_fw/main/lcd_init.c
 // 本板引脚：CS=GPIO5 / SCLK=GPIO47 / MOSI=GPIO48（走 R183/R184/R186）
 // 复位脚不在 ESP 上，由 AW9523 P1_1 控制（见 main.c）
 

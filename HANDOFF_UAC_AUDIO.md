@@ -159,7 +159,7 @@ firmware/typixdeck_esp32s3_lcd_init_touch_gui_uac_cdc/
 - `~/esp/s32_uac1_speaker/` — **UAC-only**（non-AS_PART，ESP32-S31，HS），出声的参考。用的是同一个 usb_device_uac 组件 non-AS_PART 模式。
 - `~/esp/s31_i2s_es8311_test/` — I2S + ES8311 example（IDF 官方）。
 - `~/esp/s31_es8311_mp3/` — minimp3 + ES8311。
-- `esp-iot-solution/examples/usb/device/usb_uac/`（clone 在 CyberFold 仓里）— **官方 UAC example，UAC-only，BSP codec，默认 48k/1ch**。没有 UAC+CDC composite 的官方例子。
+- `esp-iot-solution/examples/usb/device/usb_uac/`（clone 在 TypixDeck 仓里）— **官方 UAC example，UAC-only，BSP codec，默认 48k/1ch**。没有 UAC+CDC composite 的官方例子。
 
 ---
 
@@ -168,7 +168,7 @@ firmware/typixdeck_esp32s3_lcd_init_touch_gui_uac_cdc/
 ```bash
 # 编译（Mac）
 export IDF_PATH=/Users/eggfly/esp/esp-idf && source $IDF_PATH/export.sh
-cd ~/github/eggfly/CyberFold/firmware/typixdeck_esp32s3_lcd_init_touch_gui_uac_cdc
+cd ~/github/eggfly/TypixDeck/firmware/typixdeck_esp32s3_lcd_init_touch_gui_uac_cdc
 idf.py build
 scp build/typixdeck_esp32s3_lcd_init_touch_gui_uac_cdc.bin pi@192.168.3.84:~/tdflash/
 

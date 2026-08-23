@@ -7,7 +7,7 @@
 // AS_PART 模式下 CONFIG_UAC_TUSB_* Kconfig 不暴露，直接硬编码（app 全权控制描述符）
 #define UAC_TUSB_VID         0x303A   // Espressif
 #define UAC_TUSB_PID         0x80C1   // TypixDeck UAC+CDC composite
-#define UAC_TUSB_MANUFACTURER "CyberFold"
+#define UAC_TUSB_MANUFACTURER "TypixDeck"
 #define UAC_TUSB_PRODUCT      "TypixDeck UAC+CDC"
 #define UAC_TUSB_SERIAL       "TD0720"
 

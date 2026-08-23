@@ -19,7 +19,7 @@ static int s_head = 0;    // 下一个写入位置
 static int s_count = 0;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
-// ---- 容量自学习（库仑计数法，CyberFold 电源固件同款思路）----
+// ---- 容量自学习（库仑计数法，TypixDeck 电源固件同款思路）----
 // 只在**放电段**学习：拔电时 U4(VBAT INA219) 电流≈电池放电电流；
 // 插电时 U4 测的是整机输出功率，电池真实充电电流没有直接测点
 // （≈P_in−P_out，还含充电效率不确定），不参与积分。
