@@ -2,7 +2,8 @@ idf_component_register(
     SRCS "main.c" "aw9523.c" "gt911.c" "lcd_spi_init.c" "audio.c"
          "sensors.c" "batt_log.c" "vsync_mon.c" "ui.c" "ttf_font.c"
     INCLUDE_DIRS "."
-    REQUIRES driver esp_lcd esp_timer esp_driver_i2s esp_hw_support usb_device_uac
+    EMBED_FILES "../fonts/special_elite_subset.ttf"
+    REQUIRES driver esp_lcd esp_timer esp_app_format esp_driver_i2s esp_hw_support usb_device_uac
              espressif__tinyusb esp_partition nvs_flash
 )
 

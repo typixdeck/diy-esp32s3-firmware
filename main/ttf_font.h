@@ -22,3 +22,18 @@ int ttf_draw_text(uint16_t *fb, int fb_w, int fb_h,
 
 // 文本像素宽（不画，用于居中/右对齐）
 int ttf_text_width(int size, const char *utf8);
+
+// ---- 第二字面（2026-09-10）：开机画面字标用 Special Elite（打字机体，OFL），
+//      子集 TTF 内嵌在 app 里（fonts/special_elite_subset.ttf，EMBED_FILES）----
+#define TTF_FACE_MAIN   0     // 阿里巴巴普惠体（font 分区）
+#define TTF_FACE_DECO   1     // Special Elite（app 内嵌，仅拉丁）
+#define TTF_FACE_COUNT  2
+#include <stddef.h>
+// 在 ttf_font_init() 之后注册；data 必须常驻（rodata/mmap）
+esp_err_t ttf_font_add_face(int face, const uint8_t *data, size_t len);
+bool ttf_face_ready(int face);
+// spacing = 额外字距（像素，可为负），做打字机式宽字距标题用
+int ttf_draw_text_face(int face, uint16_t *fb, int fb_w, int fb_h,
+                       int x, int y, int size, int spacing, uint16_t color, const char *utf8);
+int ttf_text_width_face(int face, int size, int spacing, const char *utf8);
+

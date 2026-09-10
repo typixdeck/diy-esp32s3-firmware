@@ -471,14 +471,16 @@ static volatile uint32_t s_hp_event_ms = 0;      // 事件时间戳（tick ms）
 void tud_cdc_rx_cb(uint8_t itf)
 {
     (void)itf;
-    static char line[64];
+    static char line[160];   // PI_INFO 遥测行可到 ~120 字节
     static size_t pos = 0;
     while (tud_cdc_available()) {
         char c;
         if (tud_cdc_read(&c, 1) == 0) break;
         if (c == '\r' || c == '\n') {
             line[pos] = '\0';
-            if (pos && strstr(line, "REBOOT_TO_BOOT_MODE")) {
+            if (pos && strstr(line, "PI_INFO ")) {
+                ui_set_pi_info(strstr(line, "PI_INFO ") + 8);     // Pi 端 systemd 遥测
+            } else if (pos && strstr(line, "REBOOT_TO_BOOT_MODE")) {
                 s_reboot_to_boot = true;
             } else if (pos && strstr(line, "AUDIO_DUMP")) {
                 s_audio_dump = true;
@@ -494,6 +496,8 @@ void tud_cdc_rx_cb(uint8_t itf)
                 ui_request_theme(strstr(line, "THEME_")[6] - '0');   // 远程验证 UI 用
             } else if (pos && strstr(line, "TAB_")) {
                 ui_request_tab(strstr(line, "TAB_")[4] - '0');
+            } else if (pos && strstr(line, "LANG_")) {
+                ui_request_lang(strstr(line, "LANG_")[5] - '0');    // 0=EN 1=简 2=繁 3=日
             } else if (pos && strstr(line, "TOGGLE_SCREEN")) {
                 s_kbd_toggle_req = true;                             // 等价 □ 键/SW3
             }
@@ -650,6 +654,12 @@ static void cdc_stats_task(void *arg)
                 tud_cdc_write_flush();
                 vTaskDelay(pdMS_TO_TICKS(80));   // 让 CDC 把提示发出去再死
             }
+            // ⚠️ 2026-09-10 实测结论：不要在这里 tud_disconnect()/复位 USB 外设。
+            // 试过"软拔出 600ms → periph_module_reset(USB) → 重启"：3 轮里 1 轮正常、
+            // 2 轮 ROM 下载模式完全不枚举（主机只见 disconnect，之后再无设备，
+            // 只能物理 RESET），比原来"偶发停在 0009 等按 RESET"更糟。ROM 的 OTG
+            // 初始化似乎依赖上电默认的 PHY/控制器状态，app 侧越"干净"它越起不来。
+            // 保持最朴素的 FORCE_DOWNLOAD_BOOT + esp_restart。
             REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
             esp_restart();
         }
@@ -1039,6 +1049,8 @@ void app_main(void)
             if (vsync_mon_signal()) {
                 // Pi 出图了：立即交屏，此后不再自动切回（除非 □）
                 ESP_LOGI(TAG, "检测到 Pi VSYNC（%.1f fps），交屏给 Pi", vsync_mon_fps());
+                ui_boot_signal_locked();               // 彩蛋：竖条满格 + LOCKED 定格
+                vTaskDelay(pdMS_TO_TICKS(350));
                 mux_select(false);
                 state = ST_PI;
                 break;

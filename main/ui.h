@@ -36,6 +36,8 @@ esp_err_t ui_init(esp_lcd_panel_handle_t panel, const ui_ctx_t *ctx);
 // ---- 开机动画 ----
 // frame 递增即旋转；show_hint=true 追加 "NO SIGNAL YET" 提示（等太久时）
 void ui_boot_anim_tick(int frame, bool show_hint);
+// Pi 出图瞬间的定格彩蛋（交屏前调用，之后 delay ~350ms 再切 MUX）
+void ui_boot_signal_locked(void);
 
 // ---- Tab 界面 ----
 ui_tab_t ui_current_tab(void);
@@ -58,3 +60,10 @@ bool ui_snapshot(uint16_t *dst);
 // ---- 调试：远程切主题/切页（CDC THEME_n / TAB_n），下次重绘时生效 ----
 void ui_request_theme(int t);
 void ui_request_tab(int t);
+void ui_request_lang(int l);   // CDC LANG_n：远程切语言（写 NVS，截图验证用）
+
+// ---- Pi 端遥测（CDC "EGGFLY_PI_INFO k=v k=v ..."，typixdeck-pi-info.service 每 2s 一行）----
+// 键：model=CM4 rev=1.0 cpu=72.1 nvme=41 fan=3200 thr=0x0 load=0.52 up=1234
+// 任意任务上下文可调（tinyusb rx 回调），内部拷贝并打时间戳；>8s 无更新视为离线
+void ui_set_pi_info(const char *kv_line);
+

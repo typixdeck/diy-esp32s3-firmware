@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -10,10 +11,12 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_app_desc.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
 #include "board_pins.h"
+#include "i18n.h"
 #include "batt_log.h"
 #include "sensors.h"
 #include "ttf_font.h"
@@ -147,7 +150,9 @@ static void fb_draw_text_centered(int y, const char *text, int scale, uint16_t c
 // ---------------------------------------------------------------------------
 // 语言 + 主题（设置页可切换，NVS 持久化：namespace "ui" / key "lang"/"theme"）
 // ---------------------------------------------------------------------------
-typedef enum { LANG_EN = 0, LANG_ZH = 1 } ui_lang_t;
+// 语言顺序 = NVS 里的数值 = 设置页按钮顺序，只能在末尾追加
+typedef enum { LANG_EN = 0, LANG_ZH = 1, LANG_TW = 2, LANG_JA = 3, LANG_COUNT } ui_lang_t;
+static const char *k_lang_name[LANG_COUNT] = { "English", "简体中文", "繁體中文", "日本語" };
 static ui_lang_t s_lang = LANG_EN;
 
 typedef enum {
@@ -218,10 +223,21 @@ static const theme_pal_t k_pal[TH_COUNT] = {
 
 static inline const theme_pal_t *pal(void) { return &k_pal[s_theme]; }
 
-// 双语取词：中文需要 TTF；font 分区没刷时强制回英文（中文会画成空白）
+// 多语言取词：代码里保持 (en, 简体) 双参；繁體/日语按 en 键查 i18n.h 表，
+// 查不到繁體回退简体、日语回退英文。非英文都需要 TTF；font 分区没刷时强制回英文。
 static const char *tr(const char *en, const char *zh)
 {
-    return (s_lang == LANG_ZH && ttf_font_ready()) ? zh : en;
+    if (s_lang == LANG_EN || !ttf_font_ready()) return en;
+    if (s_lang == LANG_ZH) return zh;
+    for (size_t i = 0; i < K_I18N_COUNT; i++) {
+        const i18n_entry_t *e = &k_i18n[i];
+        if (strcmp(e->en, en) != 0) continue;
+        if (e->zh && strcmp(e->zh, zh) != 0) continue;
+        const char *t = (s_lang == LANG_TW) ? e->tw : e->ja;
+        if (t) return t;
+        break;
+    }
+    return (s_lang == LANG_TW) ? zh : en;
 }
 
 static void prefs_load(void)
@@ -238,7 +254,7 @@ static void prefs_load(void)
     nvs_handle_t h;
     if (nvs_open("ui", NVS_READONLY, &h) == ESP_OK) {
         uint8_t v = 0;
-        if (nvs_get_u8(h, "lang", &v) == ESP_OK && v <= LANG_ZH) {
+        if (nvs_get_u8(h, "lang", &v) == ESP_OK && v < LANG_COUNT) {
             s_lang = (ui_lang_t)v;
         }
         if (nvs_get_u8(h, "theme", &v) == ESP_OK && v < TH_COUNT) {
@@ -246,7 +262,7 @@ static void prefs_load(void)
         }
         nvs_close(h);
     }
-    ESP_LOGI(TAG, "UI 语言：%s 主题：%d", s_lang == LANG_ZH ? "中文" : "English", s_theme);
+    ESP_LOGI(TAG, "UI 语言：%s 主题：%d", k_lang_name[s_lang], s_theme);
 }
 
 static void prefs_save(void)
@@ -261,9 +277,10 @@ static void prefs_save(void)
 
 // 远程调试（CDC THEME_n / TAB_n 命令）：跨任务只置请求，UI 重绘时消费，
 // 避免 cdc_stats_task 直接画帧缓冲与 GUI 任务打架
-static volatile int s_req_theme = -1, s_req_tab = -1;
+static volatile int s_req_theme = -1, s_req_tab = -1, s_req_lang = -1;
 void ui_request_theme(int t) { if (t >= 0 && t < TH_COUNT) s_req_theme = t; }
 void ui_request_tab(int t)   { if (t >= 0 && t < UI_TAB_COUNT) s_req_tab = t; }
+void ui_request_lang(int l)  { if (l >= 0 && l < LANG_COUNT) s_req_lang = l; }
 
 // ---------------------------------------------------------------------------
 // TTF 优先的文本绘制（阿里巴巴普惠体，中英混排）。TTF 未就绪（font 分区没刷）
@@ -288,6 +305,14 @@ static int txt_w(int size, const char *utf8)
 static void draw_txt_centered(int y, int size, uint16_t color, const char *utf8)
 {
     draw_txt((LCD_H_RES - txt_w(size, utf8)) / 2, y, size, color, utf8);
+}
+
+// 宽度受限的文本：超出 maxw 就逐级缩小字号（最小 14px），保证不冲出卡片
+static void draw_txt_fit(int x, int y, int size, int maxw, uint16_t color,
+                         const char *utf8)
+{
+    while (size > 14 && txt_w(size, utf8) > maxw) size -= 2;
+    draw_txt(x, y, size, color, utf8);
 }
 
 // 粗线段（曲线用）：Bresenham，每点画 thick×thick 方块
@@ -442,6 +467,13 @@ esp_err_t ui_init(esp_lcd_panel_handle_t panel, const ui_ctx_t *ctx)
     esp_err_t ferr = ttf_font_init();
     if (ferr != ESP_OK) {
         ESP_LOGW(TAG, "TTF 字体不可用（%s），中文将无法显示", esp_err_to_name(ferr));
+    } else {
+        // 开机字标用的打字机体（Special Elite，OFL），子集内嵌在 app 里
+        extern const uint8_t _binary_special_elite_subset_ttf_start[];
+        extern const uint8_t _binary_special_elite_subset_ttf_end[];
+        ttf_font_add_face(TTF_FACE_DECO, _binary_special_elite_subset_ttf_start,
+                          (size_t)(_binary_special_elite_subset_ttf_end -
+                                   _binary_special_elite_subset_ttf_start));
     }
     prefs_load();   // NVS 里的语言/主题偏好
     if (!s_draw_mtx) s_draw_mtx = xSemaphoreCreateMutex();
@@ -465,38 +497,186 @@ static uint16_t gray565(int lum)
     return (uint16_t)(((lum >> 3) << 11) | ((lum >> 2) << 5) | (lum >> 3));
 }
 
+// ---------------------------------------------------------------------------
+// 开机画面（2026-09-10 重做）：
+//   字标 "TypixDeck" 用 Special Elite 打字机体逐字敲出（带闪烁光标），
+//   下方 SpinKit "Wave" 五根竖条（MIT，原版 keyframes：0%/40%/100%→0.4，20%→1.0），
+//   再下方 "WAITING FOR PI SIGNAL" 宽字距小标。
+//   彩蛋：等待 20s/45s/90s 分级提示逐字打出（45s 那条是真实 SOP：SW8 拨 USB6 侧再开机）；
+//   Pi 出图瞬间竖条满格变绿 + "PI SIGNAL LOCKED" 定格 350ms 再交屏（ui_boot_signal_locked）；
+//   右下角固件版本/编译日期。每帧只重绘字标带、竖条带、提示带三块脏区。
+// ---------------------------------------------------------------------------
+#define BOOT_TICK_MS   80
+#define C_MINT         RGB(93, 202, 165)
+#define WM_TEXT        "TypixDeck"
+#define WM_SIZE        120
+#define WM_Y           190
+#define WM_SPACING     6
+#define WAVE_N         5
+#define WAVE_W         18
+#define WAVE_GAP       16
+#define WAVE_H         90
+#define WAVE_CY        470
+#define SUB_Y          556
+#define HINT_Y         640
+#define HINT_DY        40
+
+// 取 UTF-8 串前 n 个字符（按字符不按字节），写入 out
+static void utf8_prefix(const char *src, int n, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (const char *p = src; *p && n > 0; n--) {
+        int len = ((*p & 0xE0) == 0xC0) ? 2 : ((*p & 0xF0) == 0xE0) ? 3 : ((*p & 0xF8) == 0xF0) ? 4 : 1;
+        if (o + len >= cap) break;
+        memcpy(out + o, p, len); o += len; p += len;
+    }
+    out[o] = 0;
+}
+static int utf8_len(const char *s)
+{
+    int n = 0;
+    for (; *s; s++) if ((*s & 0xC0) != 0x80) n++;
+    return n;
+}
+
+// SpinKit wave：t ∈ [0,1) 周期相位 → scaleY
+static float wave_scale(float t)
+{
+    float e;
+    if (t < 0.2f)      { e = t / 0.2f;           return 0.4f + 0.6f * (0.5f - 0.5f * cosf(e * (float)M_PI)); }
+    else if (t < 0.4f) { e = (t - 0.2f) / 0.2f;  return 1.0f - 0.6f * (0.5f - 0.5f * cosf(e * (float)M_PI)); }
+    return 0.4f;
+}
+
+static void boot_draw_wave(uint32_t t_ms, uint16_t color, bool full)
+{
+    int total = WAVE_N * WAVE_W + (WAVE_N - 1) * WAVE_GAP;
+    int x0 = (LCD_H_RES - total) / 2;
+    fb_fill_rect(x0 - 4, WAVE_CY - WAVE_H / 2 - 4, total + 8, WAVE_H + 8, C_BLACK);
+    for (int i = 0; i < WAVE_N; i++) {
+        // SpinKit：第 i 根 animation-delay = -(1.1 - 0.1*i)s，即相位领先 0.1s×i
+        float t = (float)((t_ms + (uint32_t)i * 100) % 1200) / 1200.0f;
+        float sc = full ? 1.0f : wave_scale(t);
+        int h = (int)(WAVE_H * sc + 0.5f);
+        fb_fill_rect(x0 + i * (WAVE_W + WAVE_GAP), WAVE_CY - h / 2, WAVE_W, h, color);
+    }
+}
+
+// 逐字打出一行居中文本（typed = 已显示字符数），带方块光标；返回是否已打完
+static bool boot_type_line(int face, int y, int size, int spacing, uint16_t color,
+                           const char *text, int typed, bool cursor_on)
+{
+    char buf[160];
+    int n = utf8_len(text);
+    if (typed > n) typed = n;
+    utf8_prefix(text, typed, buf, sizeof(buf));
+    int full_w = (face == TTF_FACE_DECO) ? ttf_text_width_face(face, size, spacing, text)
+                                         : txt_w(size, text);
+    int x = (LCD_H_RES - full_w) / 2;
+    fb_fill_rect(0, y - 4, LCD_H_RES, size + size / 3 + 8, C_BLACK);
+    int adv;
+    if (face == TTF_FACE_DECO) {
+        adv = ttf_draw_text_face(face, s_fb, LCD_H_RES, LCD_V_RES, x, y, size, spacing, color, buf);
+    } else {
+        draw_txt(x, y, size, color, buf);
+        adv = txt_w(size, buf);
+    }
+    if (typed < n || cursor_on)
+        fb_fill_rect(x + adv + 4, y + size / 6, size / 2 > 8 ? size / 2 : 8, size, color);
+    return typed >= n;
+}
+
+static void boot_draw_version(void)
+{
+    const esp_app_desc_t *d = esp_app_get_description();
+    char buf[80];
+    snprintf(buf, sizeof(buf), "fw %s · %s", d->version, d->date);
+    int w = txt_w(16, buf);
+    draw_txt(LCD_H_RES - w - 24, LCD_V_RES - 34, 16, RGB(70, 78, 86), buf);
+}
+
 void ui_boot_anim_tick(int frame, bool show_hint)
 {
+    (void)show_hint;
     static bool s_static_drawn = false;
-    static bool s_hint_drawn = false;
+    static int  s_hint_stage = 0;     // 0 无；1=20s；2=45s；3=90s
+    static int  s_hint_typed = 0;
+    uint32_t t_ms = (uint32_t)frame * BOOT_TICK_MS;
+    bool deco = ttf_face_ready(TTF_FACE_DECO);
+
     if (!s_static_drawn) {
         s_static_drawn = true;
         fb_fill_rect(0, 0, LCD_H_RES, LCD_V_RES, C_BLACK);
-        if (ttf_font_ready()) {
-            draw_txt_centered(180, 110, C_WHITE, "TypixDeck");
-        } else {
-            fb_draw_text_centered(220, "TYPIXDECK", 10, C_WHITE);
+        if (ttf_font_ready()) boot_draw_version();
+    }
+
+    // 1. 字标打字机：每帧（80ms）敲一个字母（0.7s 打完），光标 320ms 周期闪 1s 后消失
+    int wm_n = utf8_len(WM_TEXT);
+    int typed = frame;
+    if (typed <= wm_n + 12) {
+        if (deco) {
+            bool cur = (typed < wm_n) ? true : ((frame % 4) < 2 && typed < wm_n + 12);
+            boot_type_line(TTF_FACE_DECO, WM_Y, WM_SIZE, WM_SPACING, C_WHITE, WM_TEXT, typed, cur);
+        } else if (typed == 0) {
+            if (ttf_font_ready()) draw_txt_centered(WM_Y, 110, C_WHITE, WM_TEXT);
+            else fb_draw_text_centered(WM_Y + 30, "TYPIXDECK", 10, C_WHITE);
+        }
+        // 小标在字标打完那一帧一次画出
+        if (typed == wm_n) {
+            const char *sub = "WAITING FOR PI SIGNAL";
+            if (deco) {
+                int w = ttf_text_width_face(TTF_FACE_DECO, 26, 5, sub);
+                ttf_draw_text_face(TTF_FACE_DECO, s_fb, LCD_H_RES, LCD_V_RES,
+                                   (LCD_H_RES - w) / 2, SUB_Y, 26, 5, C_GRAY, sub);
+            } else {
+                fb_draw_text_centered(SUB_Y, sub, 3, C_GRAY);
+            }
         }
     }
-    // spinner：只重绘转盘正方形区域
-    int box = SPIN_R + SPIN_DOT + 8;
-    fb_fill_rect(SPIN_CX - box, SPIN_CY - box, box * 2, box * 2, C_BLACK);
-    for (int i = 0; i < SPIN_DOTS; i++) {
-        // 相位差决定亮度：领头最亮，逆序渐隐
-        int lag = (frame - i) % SPIN_DOTS;
-        if (lag < 0) lag += SPIN_DOTS;
-        int lum = 255 - lag * (220 / SPIN_DOTS);
-        float ang = (float)i * 2.0f * (float)M_PI / SPIN_DOTS - (float)M_PI / 2;
-        int x = SPIN_CX + (int)(cosf(ang) * SPIN_R) - SPIN_DOT / 2;
-        int y = SPIN_CY + (int)(sinf(ang) * SPIN_R) - SPIN_DOT / 2;
-        fb_fill_rect(x, y, SPIN_DOT, SPIN_DOT, gray565(lum));
+
+    // 2. SpinKit wave
+    boot_draw_wave(t_ms, C_MINT, false);
+
+    // 3. 分级等待提示（逐字打出）
+    int want = (t_ms >= 90000) ? 3 : (t_ms >= 45000) ? 2 : (t_ms >= 20000) ? 1 : 0;
+    if (want != s_hint_stage) { s_hint_stage = want; s_hint_typed = 0; }
+    if (s_hint_stage > 0 && ttf_font_ready()) {
+        const char *l1 = (s_hint_stage == 1) ? tr("STILL WAITING FOR PI SIGNAL", "仍在等待树莓派信号")
+                       : (s_hint_stage == 2) ? tr("HINT: FLIP SW8 TO THE USB6 SIDE, THEN POWER ON",
+                                                  "提示：先把 SW8 拨到 USB6 侧再开机")
+                       : tr("STILL HERE. SO IS THE PI, PROBABLY.", "还在等。树莓派大概也在。");
+        const char *l2 = tr("PRESS □ KEY FOR SYSTEM MONITOR", "按 □ 键进入系统监控");
+        int n1 = utf8_len(l1);
+        if (s_hint_typed <= n1 + 8) {
+            bool done = boot_type_line(TTF_FACE_MAIN, HINT_Y, 28, 0,
+                                       s_hint_stage == 2 ? C_MINT : C_GRAY, l1, s_hint_typed,
+                                       s_hint_typed < n1 + 8 && (frame % 4) < 2);
+            if (done && s_hint_typed == n1) {
+                fb_fill_rect(0, HINT_Y + HINT_DY - 4, LCD_H_RES, 40, C_BLACK);
+                draw_txt_centered(HINT_Y + HINT_DY, 24, RGB(110, 118, 126), l2);
+            }
+            s_hint_typed++;
+        }
     }
-    if (show_hint && !s_hint_drawn) {
-        s_hint_drawn = true;
-        draw_txt_centered(636, 30, C_GRAY, tr("WAITING FOR PI VIDEO SIGNAL - NONE YET",
-                                              "等待树莓派视频信号——暂无信号"));
-        draw_txt_centered(686, 30, C_GRAY, tr("PRESS □ KEY FOR SYSTEM MONITOR",
-                                              "按 □ 键进入系统监控"));
+    fb_flush();
+}
+
+// Pi 出图瞬间的定格画面（main 在交屏前调用，随后 delay ~350ms）
+void ui_boot_signal_locked(void)
+{
+    // Pi 热复位时视频信号 1 帧内就到，打字机可能一个字母都没敲出来——
+    // 定格帧一律先把字标补完整（无光标），别让用户看到一个孤零零的光标块
+    if (ttf_face_ready(TTF_FACE_DECO))
+        boot_type_line(TTF_FACE_DECO, WM_Y, WM_SIZE, WM_SPACING, C_WHITE, WM_TEXT, 99, false);
+    boot_draw_wave(0, C_MINT, true);
+    const char *msg = tr("PI SIGNAL LOCKED", "已锁定树莓派信号");
+    fb_fill_rect(0, SUB_Y - 6, LCD_H_RES, 60, C_BLACK);
+    if (ttf_face_ready(TTF_FACE_DECO) && s_lang == LANG_EN) {
+        int w = ttf_text_width_face(TTF_FACE_DECO, 26, 5, msg);
+        ttf_draw_text_face(TTF_FACE_DECO, s_fb, LCD_H_RES, LCD_V_RES,
+                           (LCD_H_RES - w) / 2, SUB_Y, 26, 5, C_MINT, msg);
+    } else {
+        draw_txt_centered(SUB_Y, 28, C_MINT, msg);
     }
     fb_flush();
 }
@@ -517,6 +697,51 @@ static const char *k_tab_zh[UI_TAB_COUNT] = { "仪表盘", "电池曲线", "触�
 ui_tab_t ui_current_tab(void)
 {
     return s_tab;
+}
+
+// ---------------------------------------------------------------------------
+// Pi 端遥测（CDC PI_INFO）：单缓冲 + 序号，写方拷贝，读方按 key 取值
+// ---------------------------------------------------------------------------
+#define PI_INFO_MAX 128
+#define PI_INFO_STALE_MS 8000
+static char     s_pi_info[PI_INFO_MAX];
+static int64_t  s_pi_info_us = 0;
+static portMUX_TYPE s_pi_info_mux = portMUX_INITIALIZER_UNLOCKED;
+
+void ui_set_pi_info(const char *kv_line)
+{
+    if (!kv_line) return;
+    portENTER_CRITICAL(&s_pi_info_mux);
+    strlcpy(s_pi_info, kv_line, sizeof(s_pi_info));
+    s_pi_info_us = esp_timer_get_time();
+    portEXIT_CRITICAL(&s_pi_info_mux);
+}
+
+static bool pi_info_fresh(void)
+{
+    return s_pi_info_us > 0 &&
+           (esp_timer_get_time() - s_pi_info_us) < PI_INFO_STALE_MS * 1000LL;
+}
+
+// 取 "key=" 后面的值（到空格为止），没有返回 false
+static bool pi_info_get(const char *key, char *out, size_t n)
+{
+    char local[PI_INFO_MAX];
+    portENTER_CRITICAL(&s_pi_info_mux);
+    strlcpy(local, s_pi_info, sizeof(local));
+    portEXIT_CRITICAL(&s_pi_info_mux);
+    size_t kl = strlen(key);
+    for (const char *p = local; (p = strstr(p, key)) != NULL; p++) {
+        if ((p == local || p[-1] == ' ') && p[kl] == '=') {
+            const char *v = p + kl + 1, *e = v;
+            while (*e && *e != ' ') e++;
+            size_t len = (size_t)(e - v);
+            if (len == 0 || len >= n) return false;
+            memcpy(out, v, len); out[len] = 0;
+            return true;
+        }
+    }
+    return false;
 }
 
 // 右上角 Pi 信号状态芯片（所有页共用，按主题上色）
@@ -545,10 +770,26 @@ static void draw_status_chip(void)
         snprintf(buf, sizeof(buf), "PI %d.%d", (int)fps, (int)(fps * 10) % 10);
         if (s_theme == TH_TERMINAL) {
             fb_draw_text(x + 14, 16, buf, 3, fg);
-            fb_draw_text(x + 14, 48, "FPS", 2, p->text2);
+            char model[16], cpu[16], sub[24];
+            if (pi_info_fresh() && pi_info_get("model", model, sizeof(model)) &&
+                pi_info_get("cpu", cpu, sizeof(cpu))) {
+                snprintf(sub, sizeof(sub), "%s %.0fC", model, strtof(cpu, NULL));
+                fb_draw_text(x + 14, 48, sub, 2, p->text2);
+            } else {
+                fb_draw_text(x + 14, 48, "FPS", 2, p->text2);
+            }
         } else {
             draw_txt(x + 14, 10, 28, fg, buf);
-            draw_txt(x + 14, 42, 18, p->dim, tr("FPS LIVE", "FPS 实时"));
+            char model[16], cpu[16], sub[40];
+            if (pi_info_fresh() && pi_info_get("model", model, sizeof(model)) &&
+                pi_info_get("cpu", cpu, sizeof(cpu))) {
+                float t = strtof(cpu, NULL);
+                snprintf(sub, sizeof(sub), "%s · %.0f°C", model, t);
+                draw_txt_fit(x + 14, 42, 18, w - 28,
+                             t >= 80.0f ? p->bad : (t >= 70.0f ? p->warn : p->dim), sub);
+            } else {
+                draw_txt(x + 14, 42, 18, p->dim, tr("FPS LIVE", "FPS 实时"));
+            }
         }
     } else {
         if (s_theme == TH_TERMINAL) {
@@ -741,8 +982,10 @@ static void draw_runtime_estimate(int x, int y, int soc)
 // dash 页共享的一次采样
 typedef struct {
     float vbat_v, vbat_a, vbus_v, vbus_a, cw_v, stc_v, stc_soc;
+    float stc_a;            // STC3117 电池真实电流，正=充电 负=放电
     int cw_soc, soc;
     bool vbat_ok, vbus_ok, plugged;
+    bool stc_i_ok;          // STC3117 电流可读（MUX 在 ESP 侧）
     uint16_t soc_col;
 } dash_data_t;
 
@@ -761,6 +1004,8 @@ static void dash_read(dash_data_t *d)
     stc3117_ensure_running(s_ctx.stc3117);
     if (!s_ctx.stc3117 || stc3117_read(s_ctx.stc3117, &d->stc_v, &d->stc_soc) != ESP_OK)
         d->stc_soc = -1;
+    d->stc_i_ok = s_ctx.stc3117 &&
+                  stc3117_read_current(s_ctx.stc3117, &d->stc_a) == ESP_OK;
     // 主 SOC 用 STC3117（带采样电阻库仑计），CW2015 仅回退
     d->soc = d->stc_soc >= 0 ? (int)(d->stc_soc + 0.5f) : d->cw_soc;
     d->plugged = d->vbus_ok && d->vbus_v > 4.0f;
@@ -769,32 +1014,98 @@ static void dash_read(dash_data_t *d)
                : d->soc < 40 ? p->warn : p->good;
 }
 
-// 供电状态三态文案 + 续航/容量行（x 为左缘，y0 为状态行顶）。
-// 判定口径（2026-08-21 用户定，无红色状态）：
-//   未插电 → 正在放电 + 续航估算；插电且 P_in≥P_out → USB 供电中（绿）；
-//   插电但 P_in<P_out → 供电可能不足（黄），电池在补差额
-static void dash_power_status(const dash_data_t *d, int x, int y0)
+// 供电状态判定（2026-09-10 重写：以 STC3117 电池真实电流为准）
+//
+// 三颗电流表各测什么（网表实锤）：
+//   INA219 U4  (INA-BAT)：采样电阻 U23 在 VBAT→VBAT_LOAD，充电器 SLM6610 输出
+//                          经 R16 回到 VBAT_RAW（电池侧），**绕过** U23——所以
+//                          它只看得到系统负载电流，永远看不到充电电流；
+//   INA219 U20 (INA-BUS)：U39 在 VBUS_RAW→VBUS_LOAD = 全部 USB 输入；
+//   STC3117   (电池)    ：U37 10mΩ 在 BAT_N→GND，正=充电、负=放电，唯一的真实电池电流。
+//   交叉验证：USB 输入功率 ≈ 系统负载功率 + 电池充电功率（各自效率损耗内）。
+//
+// 旧逻辑把 INA-BAT 电流当"电池输出"，充电末段（输入≈负载）就会在临界值附近
+// 反复跳"供电可能不足"——2026-09-10 用户实机截图证实。
+//
+// 状态（带迟滞）：未插电→正在放电；插电 & I_bat>+80mA→充电中；插电 & I_bat<-80mA
+// →供电不足电池补差；其余→USB 供电中（电池电流≈0 即已充满/涓流）。
+// STC3117 不可读（MUX 在 Pi 侧）时回退功率差判定，同样带迟滞。
+enum { PS_NONE = -1, PS_DISCHARGE, PS_CHARGING, PS_USB, PS_DEFICIT };
+static int s_ps = PS_NONE;
+
+static int dash_power_state(const dash_data_t *d)
+{
+    if (!d->plugged) return PS_DISCHARGE;
+    if (d->stc_i_ok) {
+        float i = d->stc_a;
+        float in_hi = 0.08f, out_lo = 0.03f;   // 进入/退出阈值（A）
+        if (s_ps == PS_CHARGING) return i > out_lo ? PS_CHARGING
+                                      : (i < -in_hi ? PS_DEFICIT : PS_USB);
+        if (s_ps == PS_DEFICIT)  return i < -out_lo ? PS_DEFICIT
+                                      : (i > in_hi ? PS_CHARGING : PS_USB);
+        if (i > in_hi)  return PS_CHARGING;
+        if (i < -in_hi) return PS_DEFICIT;
+        return PS_USB;
+    }
+    // 回退：只有功率差可用（负载 - 输入），>0.6W 判不足，<0.2W 恢复
+    float gap = (d->vbat_ok ? d->vbat_v * d->vbat_a : 0.0f)
+              - (d->vbus_ok ? d->vbus_v * d->vbus_a : 0.0f);
+    if (s_ps == PS_DEFICIT) return gap > 0.2f ? PS_DEFICIT : PS_USB;
+    return gap > 0.6f ? PS_DEFICIT : PS_USB;
+}
+
+// 画状态行 + 三路电流交叉验证行 + 续航/容量行。x 左缘、y0 状态行顶、maxw 可用宽度。
+// 返回最后一行之后的 y，供调用方继续排版。
+static int dash_power_status(const dash_data_t *d, int x, int y0, int maxw)
 {
     const theme_pal_t *p = pal();
     char buf[96];
-    float p_out = d->vbat_v * d->vbat_a;
-    float p_in  = d->vbus_ok ? d->vbus_v * d->vbus_a : 0.0f;
-    if (!d->plugged) {
-        draw_txt(x, y0, 32, p->warn, tr("DISCHARGING", "正在放电"));
-        draw_runtime_estimate(x, y0 + 44, d->soc);
-        draw_capacity_line(x, y0 + 70, d->soc);
-    } else if (p_in >= p_out) {
-        draw_txt(x, y0, 32, p->good, tr("USB POWERED", "USB 供电中"));
-        draw_capacity_line(x, y0 + 44, d->soc);
-    } else {
-        draw_txt(x, y0, 32, p->warn, tr("POWER MAY BE LOW", "供电可能不足"));
-        snprintf(buf, sizeof(buf),
-                 tr("IN %.2fW < OUT %.2fW, BATT FILLS GAP",
-                    "输入 %.2fW < 输出 %.2fW，电池在补差额"),
-                 p_in, p_out);
-        draw_txt(x, y0 + 44, 18, p->warn, buf);
-        draw_capacity_line(x, y0 + 70, d->soc);
+    int st = dash_power_state(d);
+    s_ps = st;
+
+    const char *title; uint16_t col;
+    switch (st) {
+    case PS_DISCHARGE: title = tr("DISCHARGING", "正在放电");        col = p->warn; break;
+    case PS_CHARGING:  title = tr("CHARGING", "充电中");             col = p->good; break;
+    case PS_DEFICIT:   title = tr("POWER MAY BE LOW", "供电可能不足"); col = p->warn; break;
+    default:
+        if (d->stc_i_ok && (d->soc >= 97 || d->vbat_v > 4.15f))
+            title = tr("FULL · USB POWERED", "已充满 · USB 供电中");
+        else
+            title = tr("USB POWERED", "USB 供电中");
+        col = p->good; break;
     }
+    draw_txt_fit(x, y0, 32, maxw, col, title);
+
+    int y = y0 + 44, dy = 22;
+    // 交叉验证三行：USB 输入 / 系统负载 / 电池电流
+    if (d->vbus_ok)
+        snprintf(buf, sizeof(buf), tr("USB IN   %4.0f mA  %.2f W", "USB 输入  %4.0f mA  %.2f W"),
+                 d->vbus_a * 1000.0f, d->vbus_v * d->vbus_a);
+    else
+        snprintf(buf, sizeof(buf), tr("USB IN   --", "USB 输入  --"));
+    draw_txt_fit(x, y, 18, maxw, p->text2, buf); y += dy;
+    if (d->vbat_ok)
+        snprintf(buf, sizeof(buf), tr("LOAD     %4.0f mA  %.2f W", "系统负载  %4.0f mA  %.2f W"),
+                 d->vbat_a * 1000.0f, d->vbat_v * d->vbat_a);
+    else
+        snprintf(buf, sizeof(buf), tr("LOAD     --", "系统负载  --"));
+    draw_txt_fit(x, y, 18, maxw, p->text2, buf); y += dy;
+    if (d->stc_i_ok)
+        snprintf(buf, sizeof(buf), tr("BATTERY  %+4.0f mA  %+.2f W", "电池电流  %+4.0f mA  %+.2f W"),
+                 d->stc_a * 1000.0f, d->stc_a * d->vbat_v);
+    else
+        snprintf(buf, sizeof(buf), tr("BATTERY  -- (MUX AT PI)", "电池电流  --（MUX 在 Pi 侧）"));
+    draw_txt_fit(x, y, 18, maxw,
+                 st == PS_DEFICIT ? p->warn : (st == PS_CHARGING ? p->good : p->text2), buf);
+    y += dy + 6;
+
+    if (st == PS_DISCHARGE) {
+        draw_runtime_estimate(x, y, d->soc);
+        y += 22;
+    }
+    draw_capacity_line(x, y, d->soc);
+    return y + 22;
 }
 
 // 两颗电量计交叉读数小字
@@ -890,10 +1201,16 @@ static void draw_page_dash_cards(const dash_data_t *d, uint32_t uptime_s)
         snprintf(buf, sizeof(buf), "%.3f V", d->vbat_v);
         if (term) fb_draw_text(rx, by + 48, buf, 5, p->text);
         else      draw_txt(rx, by + 40, 48, p->text, buf);
-        snprintf(buf, sizeof(buf), "%+.0f mA · %.2f W", d->vbat_a * 1000.0f,
-                 d->vbat_v * d->vbat_a);
-        draw_txt(rx, by + 108, 26, p->text2, buf);
-        dash_power_status(d, rx, by + 150);
+        // 电压下方的大字：优先电池真实电流（STC3117），不可读时退回负载电流
+        int maxw = bx + bw2 - 24 - rx;
+        if (d->stc_i_ok)
+            snprintf(buf, sizeof(buf), tr("BATT %+.0f mA · %+.2f W", "电池 %+.0f mA · %+.2f W"),
+                     d->stc_a * 1000.0f, d->stc_a * d->vbat_v);
+        else
+            snprintf(buf, sizeof(buf), tr("LOAD %.0f mA · %.2f W", "负载 %.0f mA · %.2f W"),
+                     d->vbat_a * 1000.0f, d->vbat_v * d->vbat_a);
+        draw_txt_fit(rx, by + 108, 26, maxw, p->text2, buf);
+        dash_power_status(d, rx, by + 150, maxw);
     } else {
         draw_txt(rx, by + 100, 30, p->bad, tr("INA219 READ FAIL", "INA219 读取失败"));
     }
@@ -959,21 +1276,28 @@ static void draw_page_dash_ev(const dash_data_t *d, uint32_t uptime_s)
     // 右列读数
     int rx = 520;
     if (d->vbat_ok) {
-        snprintf(buf, sizeof(buf), "%+.0f mA", d->vbat_a * 1000.0f);
+        // 大字：电池真实电流（STC3117）/ 不可读时负载电流；第二行系统负载功率
+        if (d->stc_i_ok)
+            snprintf(buf, sizeof(buf), "%+.0f mA", d->stc_a * 1000.0f);
+        else
+            snprintf(buf, sizeof(buf), "%.0f mA", d->vbat_a * 1000.0f);
         draw_txt(rx, 110, 54, p->text, buf);
+        draw_txt(rx + 300, 132, 22, p->dim,
+                 d->stc_i_ok ? tr("BATTERY", "电池电流") : tr("LOAD", "负载电流"));
         fb_fill_rect(rx, 182, 460, 1, p->frame);
         snprintf(buf, sizeof(buf), "%.2f W", d->vbat_v * d->vbat_a);
         draw_txt(rx, 196, 54, p->text, buf);
+        draw_txt(rx + 300, 218, 22, p->dim, tr("LOAD", "系统负载"));
         fb_fill_rect(rx, 268, 460, 1, p->frame);
-        dash_power_status(d, rx, 284);
-        dash_gauge_footnotes(d, rx, 396, 18);
+        int y = dash_power_status(d, rx, 284, 460);   // 插电时到 ~422
+        dash_gauge_footnotes(d, rx, y, 18);            // 两行到 ~458，USB 块从 468 起
     } else {
         draw_txt(rx, 140, 30, p->bad, tr("INA219 READ FAIL", "INA219 读取失败"));
     }
 
     // USB 供电条状模块
     {
-        int ux = rx, uy = 440, uw = 460, uh = 80;
+        int ux = rx, uy = 468, uw = 460, uh = 80;
         fb_fill_round_rect(ux, uy, uw, uh, 12, p->card);
         draw_txt(ux + 20, uy + 10, 22, p->text2, tr("USB POWER", "USB 供电"));
         if (d->vbus_ok) {
@@ -990,9 +1314,9 @@ static void draw_page_dash_ev(const dash_data_t *d, uint32_t uptime_s)
     // 底部 telltale 传感器块
     snprintf(buf, sizeof(buf), tr("SENSORS %d/%d", "传感器在位 %d/%d"),
              s_present_ok, (int)N_SENSORS);
-    draw_txt(36, 548, 20, p->dim, buf);
+    draw_txt(36, 556, 20, p->dim, buf);
     for (int i = 0; i < (int)N_SENSORS; i++) {
-        int x = 36 + i * 96, y = 580;
+        int x = 36 + i * 96, y = 586;
         bool ok = s_present[i];
         fb_fill_round_rect(x, y, 88, 66, 10, p->card);
         fb_rect_outline(x, y, 88, 66, 1, ok ? p->frame : p->bad);
@@ -1205,6 +1529,47 @@ static void draw_page_pisig(void)
              (unsigned long)vsync_mon_storms());
     draw_txt(80, y + 88, 28, p->text2, buf);
 
+    // 右列：Pi 端遥测（systemd typixdeck-pi-info 经 CDC 推送）
+    {
+        int tx = 560, ty = y - 6, tdy = 30;
+        char v[24], v2[24];
+        if (pi_info_fresh()) {
+            draw_txt(tx, ty, 22, p->good, tr("PI TELEMETRY (CDC)", "Pi 遥测（CDC）")); ty += tdy;
+            if (pi_info_get("model", v, sizeof(v))) {
+                if (pi_info_get("rev", v2, sizeof(v2)))
+                    snprintf(buf, sizeof(buf), tr("MODEL: %s REV %s", "型号: %s Rev %s"), v, v2);
+                else
+                    snprintf(buf, sizeof(buf), tr("MODEL: %s", "型号: %s"), v);
+                draw_txt(tx, ty, 22, p->text2, buf); ty += tdy;
+            }
+            if (pi_info_get("cpu", v, sizeof(v))) {
+                float t = strtof(v, NULL);
+                snprintf(buf, sizeof(buf), tr("CPU: %.1f°C", "核心温度: %.1f°C"), t);
+                draw_txt(tx, ty, 22, t >= 80 ? p->bad : (t >= 70 ? p->warn : p->text2), buf); ty += tdy;
+            }
+            if (pi_info_get("nvme", v, sizeof(v))) {
+                snprintf(buf, sizeof(buf), tr("NVME: %s°C", "NVMe: %s°C"), v);
+                draw_txt(tx, ty, 22, p->text2, buf); ty += tdy;
+            }
+            if (pi_info_get("fan", v, sizeof(v))) {
+                snprintf(buf, sizeof(buf), tr("FAN: %s RPM", "风扇: %s RPM"), v);
+                draw_txt(tx, ty, 22, p->text2, buf); ty += tdy;
+            }
+            if (pi_info_get("thr", v, sizeof(v))) {
+                bool bad = strcmp(v, "0x0") != 0;
+                snprintf(buf, sizeof(buf), tr("THROTTLED: %s", "降频标志: %s"), v);
+                draw_txt(tx, ty, 22, bad ? p->warn : p->text2, buf); ty += tdy;
+            }
+            if (pi_info_get("load", v, sizeof(v))) {
+                snprintf(buf, sizeof(buf), tr("LOAD: %s", "负载: %s"), v);
+                draw_txt(tx, ty, 22, p->text2, buf); ty += tdy;
+            }
+        } else {
+            draw_txt(tx, ty, 22, p->dim, tr("PI TELEMETRY: OFFLINE", "Pi 遥测: 离线")); ty += tdy;
+            draw_txt(tx, ty, 18, p->dim, tr("typixdeck-pi-info.service not running",
+                                            "typixdeck-pi-info 服务未运行"));
+        }
+    }
     draw_txt(80, y + 150, 22, p->dim,
              tr("SENSE PATH: PI GPIO2 (DPI VSYNC) - R83 -",
                 "探测链路: Pi GPIO2 (DPI VSYNC) → R83 →"));
@@ -1218,11 +1583,11 @@ static void draw_page_pisig(void)
 // ---------------------------------------------------------------------------
 // 设置页：语言 + 主题（触摸即切换并写 NVS）
 // ---------------------------------------------------------------------------
-#define LBTN_W    360
+#define LBTN_W    218            // 四个语言按钮与主题按钮同网格
 #define LBTN_H    100
 #define LBTN_Y    (CONTENT_Y + 78)
-#define LBTN_EN_X 60
-#define LBTN_ZH_X 460
+#define LBTN_X0   60
+#define LBTN_DX   232
 
 #define TBTN_W    218
 #define TBTN_H    170
@@ -1249,9 +1614,9 @@ static void draw_page_setup(void)
     const theme_pal_t *p = pal();
     draw_txt(60, CONTENT_Y + 14, 32, p->accent, tr("Language 语言", "语言 Language"));
 
-    for (int i = 0; i < 2; i++) {
-        int x = (i == 0) ? LBTN_EN_X : LBTN_ZH_X;
-        bool sel = (s_lang == ((i == 0) ? LANG_EN : LANG_ZH));
+    for (int i = 0; i < LANG_COUNT; i++) {
+        int x = LBTN_X0 + i * LBTN_DX;
+        bool sel = (s_lang == (ui_lang_t)i);
         if (s_theme == TH_MINIMAL) {
             fb_fill_round_rect(x, LBTN_Y, LBTN_W, LBTN_H, 18,
                                sel ? p->tab_sel_bg : p->card);
@@ -1260,10 +1625,10 @@ static void draw_page_setup(void)
             fb_rect_outline(x, LBTN_Y, LBTN_W, LBTN_H, sel ? 3 : 1,
                             sel ? p->accent : p->frame);
         }
-        const char *label = (i == 0) ? "English" : "中文";
+        const char *label = k_lang_name[i];
         uint16_t fg = (s_theme == TH_MINIMAL && sel) ? p->tab_sel_fg
                     : sel ? p->text : p->dim;
-        draw_txt(x + (LBTN_W - txt_w(40, label)) / 2, LBTN_Y + 28, 40, fg, label);
+        draw_txt(x + (LBTN_W - txt_w(34, label)) / 2, LBTN_Y + 31, 34, fg, label);
     }
 
     draw_txt(60, CONTENT_Y + 230, 32, p->accent, tr("Theme 主题", "主题 Theme"));
@@ -1305,6 +1670,10 @@ static void draw_page_setup(void)
 void ui_page_draw(uint32_t uptime_s)
 {
     // 消费远程调试请求（CDC THEME_n / TAB_n），在 GUI 任务上下文安全生效
+    if (s_req_lang >= 0) {
+        if ((ui_lang_t)s_req_lang != s_lang) { s_lang = (ui_lang_t)s_req_lang; prefs_save(); }
+        s_req_lang = -1;
+    }
     if (s_req_theme >= 0) {
         int t = s_req_theme;
         s_req_theme = -1;
@@ -1365,10 +1734,11 @@ void ui_handle_touch(int x, int y, bool pressed)
     // 设置页：语言 / 主题按钮（重复点击同一按钮无副作用）
     if (s_tab == UI_TAB_SETUP) {
         if (y >= LBTN_Y && y < LBTN_Y + LBTN_H) {
-            ui_lang_t want;
-            if (x >= LBTN_EN_X && x < LBTN_EN_X + LBTN_W)      want = LANG_EN;
-            else if (x >= LBTN_ZH_X && x < LBTN_ZH_X + LBTN_W) want = LANG_ZH;
-            else return;
+            ui_lang_t want = s_lang;
+            for (int i = 0; i < LANG_COUNT; i++) {
+                int bx = LBTN_X0 + i * LBTN_DX;
+                if (x >= bx && x < bx + LBTN_W) { want = (ui_lang_t)i; break; }
+            }
             if (want != s_lang) {
                 s_lang = want;
                 prefs_save();
