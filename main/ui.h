@@ -17,6 +17,7 @@ typedef enum {
     UI_TAB_BATT,
     UI_TAB_TOUCH,
     UI_TAB_PISIG,
+    UI_TAB_SENSORS, // 传感器在位（从仪表盘独立出来，2026-09-11）
     UI_TAB_SETUP,   // 设置页：语言切换（NVS 持久化）
     UI_TAB_COUNT,
 } ui_tab_t;
@@ -66,4 +67,10 @@ void ui_request_lang(int l);   // CDC LANG_n：远程切语言（写 NVS，截�
 // 键：model=CM4 rev=1.0 cpu=72.1 nvme=41 fan=3200 thr=0x0 load=0.52 up=1234
 // 任意任务上下文可调（tinyusb rx 回调），内部拷贝并打时间戳；>8s 无更新视为离线
 void ui_set_pi_info(const char *kv_line);
+
+// MUX 归属通知（main 的 mux_select 调用）：ESP 持屏时才探测 MUX 后面的器件
+// （STC3117/GT911），且切到 ESP 侧后立刻重新探测一轮
+void ui_notify_mux(bool esp_side);
+// 仪表盘蓄水池动画 tick（main 在 ESP 持屏时每 ~20ms 调；内部限频 ~12fps，只重绘管道/水面）
+void ui_dash_anim_tick(void);
 

@@ -1,0 +1,19 @@
+# ESP-IDF build output
+build/
+sdkconfig
+sdkconfig.old
+.cache/
+
+# Managed components are fetched by the component manager from
+# dependencies.lock; only our patched ES8389 files are tracked.
+# (Fresh clone: see README "Building" - the partial dir must be moved
+#  aside once so the manager can download the rest.)
+managed_components/*
+!managed_components/espressif__esp_codec_dev/
+managed_components/espressif__esp_codec_dev/*
+!managed_components/espressif__esp_codec_dev/device/
+managed_components/espressif__esp_codec_dev/device/*
+!managed_components/espressif__esp_codec_dev/device/es8389/
+!managed_components/espressif__esp_codec_dev/device/include/
+managed_components/espressif__esp_codec_dev/device/include/*
+!managed_components/espressif__esp_codec_dev/device/include/es8389_codec.h

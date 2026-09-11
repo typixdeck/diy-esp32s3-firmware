@@ -236,6 +236,7 @@ static volatile bool s_mux_esp_side = true;
 static esp_err_t mux_select(bool esp_side)
 {
     s_mux_esp_side = esp_side;
+    ui_notify_mux(esp_side);
     esp_err_t err = ESP_FAIL;
     for (int i = 0; i < 3; i++) {
         err = aw9523_update_bits(s_aw9523, AW9523_REG_OUTPUT_P0,
@@ -1075,6 +1076,9 @@ void app_main(void)
                 if (mux_select(true) != ESP_OK) {
                     ESP_LOGE(TAG, "MUX 切换失败");
                 }
+                // MUX 到 ESP 侧后 STC3117/GT911 才可读：~100ms 后立刻重绘一次，
+                // 免得第一帧的 "--%" / 旧探测结果停留 500ms
+                last_draw_ms = now_ms - 400;
                 state = ST_ESP_UI;
             }
             break;
@@ -1100,6 +1104,7 @@ void app_main(void)
                     }
                 }
             }
+            ui_dash_anim_tick();                   // 仪表盘蓄水池：管道流动 + 水面波纹
             ui_maybe_flush();                      // 触摸轨迹增量冲刷（限频 15Hz）
             if (now_ms - last_draw_ms >= 500) {
                 ui_page_draw(now_ms / 1000);

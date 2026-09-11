@@ -685,14 +685,14 @@ void ui_boot_signal_locked(void)
 // Tab 框架
 // ---------------------------------------------------------------------------
 #define TAB_BAR_H     78
-#define TAB_W         170            // 5 页 ×170 = 850，右侧留给状态芯片
+#define TAB_W         146            // 6 页 ×146 = 876，右侧 138px 给状态芯片
 #define CONTENT_Y     (TAB_BAR_H + 12)
 
 static ui_tab_t s_tab = UI_TAB_DASH;
 static uint32_t s_last_uptime_s = 0;
 
-static const char *k_tab_en[UI_TAB_COUNT] = { "DASH", "BATTERY", "TOUCH", "PI SIG", "SETUP" };
-static const char *k_tab_zh[UI_TAB_COUNT] = { "仪表盘", "电池曲线", "触摸测试", "PI 信号", "设置" };
+static const char *k_tab_en[UI_TAB_COUNT] = { "DASH", "BATTERY", "TOUCH", "PI SIG", "SENSORS", "SETUP" };
+static const char *k_tab_zh[UI_TAB_COUNT] = { "仪表盘", "电池曲线", "触摸测试", "PI 信号", "传感器", "设置" };
 
 ui_tab_t ui_current_tab(void)
 {
@@ -811,7 +811,9 @@ static void draw_tab_bar(void)
         int x = i * TAB_W;
         bool sel = ((ui_tab_t)i == s_tab);
         const char *name = tr(k_tab_en[i], k_tab_zh[i]);
-        int tw = txt_w(26, name);
+        int tsz = 26;
+        while (tsz > 16 && txt_w(tsz, name) > TAB_W - 20) tsz -= 2;
+        int tw = txt_w(tsz, name);
 
         switch (s_theme) {
         case TH_CYBER:
@@ -822,7 +824,7 @@ static void draw_tab_bar(void)
             } else {
                 fb_rect_outline(x + 4, 8, TAB_W - 8, TAB_BAR_H - 16, 1, p->frame);
             }
-            draw_txt(x + (TAB_W - tw) / 2, 24, 26,
+            draw_txt(x + (TAB_W - tw) / 2, 24 + (26 - tsz) / 2, tsz,
                      sel ? p->tab_sel_fg : p->tab_fg, name);
             break;
         case TH_MINIMAL:
@@ -830,14 +832,14 @@ static void draw_tab_bar(void)
                 fb_fill_round_rect(x + 6, 10, TAB_W - 12, TAB_BAR_H - 20,
                                    (TAB_BAR_H - 20) / 2, p->tab_sel_bg);
             }
-            draw_txt(x + (TAB_W - tw) / 2, 24, 26,
+            draw_txt(x + (TAB_W - tw) / 2, 24 + (26 - tsz) / 2, tsz,
                      sel ? p->tab_sel_fg : p->tab_fg, name);
             break;
         case TH_TERMINAL: {
             // [标签] 文本式 tab，选中反白
             if (sel) fb_fill_rect(x + 4, 14, TAB_W - 8, TAB_BAR_H - 28, p->tab_sel_bg);
             uint16_t fg = sel ? p->tab_sel_fg : p->tab_fg;
-            draw_txt(x + (TAB_W - tw) / 2, 24, 26, fg, name);
+            draw_txt(x + (TAB_W - tw) / 2, 24 + (26 - tsz) / 2, tsz, fg, name);
             if (!sel) {
                 draw_txt(x + 6, 24, 26, p->dim, "[");
                 draw_txt(x + TAB_W - 20, 24, 26, p->dim, "]");
@@ -846,7 +848,7 @@ static void draw_tab_bar(void)
         }
         case TH_EV:
         default:
-            draw_txt(x + (TAB_W - tw) / 2, 22, 26,
+            draw_txt(x + (TAB_W - tw) / 2, 22 + (26 - tsz) / 2, tsz,
                      sel ? p->tab_sel_fg : p->tab_fg, name);
             if (sel) fb_fill_rect(x + 24, TAB_BAR_H - 8, TAB_W - 48, 5, p->accent);
             break;
@@ -895,18 +897,18 @@ static void ui_card(int x, int y, int w, int h, uint16_t accent, const char *tit
 // DASH 页（原遥测页，内容下移让出 Tab 栏）
 // ---------------------------------------------------------------------------
 // 板上 I2C 器件在位探测（名字 + 主/备地址；0 表示无备用地址）
-typedef struct { const char *name; uint8_t addr, alt; } sensor_desc_t;
+typedef struct { const char *name; uint8_t addr[4]; bool behind_mux; } sensor_desc_t;
 static const sensor_desc_t k_sensors[] = {
-    { "AW9523",  0x5B, 0    },  // U16 IO 扩展器
-    { "INA-BAT", 0x40, 0    },  // U4  电池电流计
-    { "INA-BUS", 0x41, 0    },  // U20 USB 电流计
-    { "CW2015",  0x62, 0    },  // U27 电量计
-    { "STC3117", 0x70, 0    },  // U53 电量计（MUX 后）
-    { "QMI8658", 0x6A, 0x6B },  // U6  IMU
-    { "RX8130",  0x32, 0    },  // U59 RTC
-    { "ES8389",  0x10, 0x11 },  // U12 Codec
-    { "GT911",   0x5D, 0x14 },  // 触摸（MUX 后）
-    { "KBD6R11", 0x1F, 0    },  // U32 键盘 STM32（QMK I2C 从机）
+    { "AW9523",  { 0x5B },                   false },  // U16 IO 扩展器
+    { "INA-BAT", { 0x40 },                   false },  // U4  电池电流计
+    { "INA-BUS", { 0x41 },                   false },  // U20 USB 电流计
+    { "CW2015",  { 0x62 },                   false },  // U27 电量计
+    { "STC3117", { 0x70 },                   true  },  // U53 电量计（MUX 后）
+    { "QMI8658", { 0x6A, 0x6B },             false },  // U6  IMU（0720 未贴）
+    { "RX8130",  { 0x32 },                   false },  // U59 RTC
+    { "ES8389",  { 0x10, 0x11, 0x12, 0x13 }, false },  // U12 Codec：AD1 悬空，地址在 0x10-0x13 漂（同 audio.c）
+    { "GT911",   { 0x5D, 0x14 },             true  },  // 触摸（MUX 后）
+    { "KBD6R11", { 0x1F },                   false },  // U32 键盘 STM32（QMK I2C 从机）
 };
 #define N_SENSORS (sizeof(k_sensors) / sizeof(k_sensors[0]))
 
@@ -915,17 +917,29 @@ static bool s_present[N_SENSORS];
 static int s_present_ok = 0;
 static int64_t s_present_ts_us = -1;
 
+static bool s_mux_esp = true;   // main 通过 ui_notify_mux 维护；开机 MUX 在 ESP 侧
+
+void ui_notify_mux(bool esp_side)
+{
+    if (esp_side && !s_mux_esp) s_present_ts_us = -1;   // 切回 ESP 侧：立刻重探一轮
+    s_mux_esp = esp_side;
+}
+
+// 只在 ESP 持屏时探测：MUX 在 Pi 侧时 STC3117/GT911 必然无应答，探了只会误报
+// （用户反馈的 "6/10" 就是切屏瞬间探到的假结果），沿用上一轮结果即可。
 static void sensors_probe_maybe(void)
 {
     int64_t now = esp_timer_get_time();
+    if (!s_mux_esp) return;
     if (s_present_ts_us >= 0 && now - s_present_ts_us < 5 * 1000000LL) return;
     s_present_ts_us = now;
     s_present_ok = 0;
     for (int i = 0; i < N_SENSORS; i++) {
-        s_present[i] = i2c_master_probe(s_ctx.bus, k_sensors[i].addr, 50) == ESP_OK ||
-                       (k_sensors[i].alt &&
-                        i2c_master_probe(s_ctx.bus, k_sensors[i].alt, 50) == ESP_OK);
-        if (s_present[i]) s_present_ok++;
+        bool ok = false;
+        for (int a = 0; a < 4 && k_sensors[i].addr[a] && !ok; a++)
+            ok = i2c_master_probe(s_ctx.bus, k_sensors[i].addr[a], 50) == ESP_OK;
+        s_present[i] = ok;
+        if (ok) s_present_ok++;
     }
 }
 
@@ -989,6 +1003,7 @@ typedef struct {
     uint16_t soc_col;
 } dash_data_t;
 
+static dash_data_t s_dash_last;          // 动画 tick 用的最近一次采样
 static void dash_read(dash_data_t *d)
 {
     const theme_pal_t *p = pal();
@@ -1006,12 +1021,15 @@ static void dash_read(dash_data_t *d)
         d->stc_soc = -1;
     d->stc_i_ok = s_ctx.stc3117 &&
                   stc3117_read_current(s_ctx.stc3117, &d->stc_a) == ESP_OK;
-    // 主 SOC 用 STC3117（带采样电阻库仑计），CW2015 仅回退
-    d->soc = d->stc_soc >= 0 ? (int)(d->stc_soc + 0.5f) : d->cw_soc;
+    // 主 SOC 只用 STC3117（带采样电阻库仑计，2026-09-11 起不再回退 CW2015：
+    // 切屏瞬间 STC 还在 MUX 另一侧，回退会闪一下 CW2015 的另一个百分比）。
+    // 读不到显示 "--"，main 在 MUX 切换后 ~100ms 会补一次重绘。CW2015 只在脚注小字。
+    d->soc = d->stc_soc >= 0 ? (int)(d->stc_soc + 0.5f) : -1;
     d->plugged = d->vbus_ok && d->vbus_v > 4.0f;
     d->soc_col = d->soc < 0  ? p->dim
                : d->soc < 15 ? p->bad
                : d->soc < 40 ? p->warn : p->good;
+    s_dash_last = *d;
 }
 
 // 供电状态判定（2026-09-10 重写：以 STC3117 电池真实电流为准）
@@ -1137,83 +1155,365 @@ static void dash_footer(uint32_t uptime_s)
 }
 
 // 传感器在位 chip（按主题上壳）
-static void dash_sensor_chip(int x, int y, int w, int h, int i)
-{
-    const theme_pal_t *p = pal();
-    bool ok = s_present[i];
-    uint16_t dot = ok ? p->good : p->bad;
-    switch (s_theme) {
-    case TH_CYBER:
-        fb_fill_rect(x, y, w, h, p->card2);
-        fb_rect_outline(x, y, w, h, 1, p->frame);
-        break;
-    case TH_MINIMAL:
-        fb_fill_round_rect(x, y, w, h, 10, p->card2);
-        break;
-    default:
-        break;   // 终端/EV：无底
-    }
-    fb_fill_rect(x + 16, y + (h - 12) / 2, 12, 12, dot);
-    if (s_theme == TH_MINIMAL)
-        draw_txt(x + 42, y + (h - 26) / 2, 20, ok ? p->text2 : p->dim,
-                 k_sensors[i].name);
-    else
-        fb_draw_text(x + 42, y + (h - 14) / 2, k_sensors[i].name, 2,
-                     ok ? p->text2 : p->dim);
-}
 
 // ---- 卡片式 dash（赛博 / 极简 / 终端三主题共用几何）----
+// ---- Pi 遥测卡片：五个指标格（CPU 温度 / NVMe 温度 / 风扇 / 降频 / 型号+运行时间）----
+static void dash_tile(int x, int y, int w, int h, const char *label, const char *value,
+                      uint16_t vcol);
+static void dash_tile3(int x, int y, int w, int h, const char *label, const char *value,
+                       uint16_t vcol, const char *sub, uint16_t scol)
+{
+    dash_tile(x, y, w, h, label, value, vcol);
+    if (sub) draw_txt_fit(x + 14, y + 80, 20, w - 28, scol, sub);
+}
+
+// vcgencmd get_throttled 位解码：bit0 欠压 / bit1 限频 / bit2 降频 / bit3 软温限（当前），
+// bit16-19 同义（开机以来发生过）。返回一句人话 + 颜色。
+static const char *throttle_text(unsigned bits, uint16_t *col)
+{
+    const theme_pal_t *p = pal();
+    if (bits & (1u << 0)) { *col = p->bad;  return tr("UNDERVOLTAGE", "欠压降频"); }
+    if (bits & (1u << 3)) { *col = p->warn; return tr("SOFT TEMP LIMIT", "软温限降频"); }
+    if (bits & (1u << 2)) { *col = p->warn; return tr("OVERHEAT", "过热降频"); }
+    if (bits & (1u << 1)) { *col = p->warn; return tr("FREQ CAPPED", "频率被限"); }
+    if (bits & (1u << 16)) { *col = p->dim; return tr("WAS UNDERVOLT", "曾欠压"); }
+    if (bits & 0x000E0000u) { *col = p->dim; return tr("WAS THROTTLED", "曾降频"); }
+    *col = p->good;
+    return tr("NORMAL", "正常");
+}
+
+static void dash_tile(int x, int y, int w, int h, const char *label, const char *value,
+                      uint16_t vcol)
+{
+    const theme_pal_t *p = pal();
+    switch (s_theme) {
+    case TH_CYBER:   fb_fill_rect(x, y, w, h, p->card2); fb_rect_outline(x, y, w, h, 1, p->frame); break;
+    case TH_MINIMAL: fb_fill_round_rect(x, y, w, h, 10, p->card2); break;
+    default: break;
+    }
+    draw_txt_fit(x + 14, y + 10, 18, w - 28, p->dim, label);
+    draw_txt_fit(x + 14, y + 36, 34, w - 28, vcol, value);
+}
+
+static void dash_telemetry_card(int x, int y, int w, int h)
+{
+    const theme_pal_t *p = pal();
+    char buf[64], v[24], v2[24];
+    bool fresh = pi_info_fresh();
+    if (s_theme == TH_EV) {
+        fb_fill_round_rect(x, y, w, h, 12, p->card);
+        draw_txt(x + 20, y + 10, 22, p->text2, tr("PI TELEMETRY", "Pi 遥测"));
+    } else {
+        ui_card(x, y, w, h, p->accent2, tr("PI TELEMETRY", "Pi 遥测"));
+    }
+    if (!fresh) {
+        draw_txt(x + 24, y + 70, 26, p->dim, tr("PI TELEMETRY: OFFLINE", "Pi 遥测: 离线"));
+        draw_txt(x + 24, y + 108, 18, p->dim,
+                 tr("typixdeck-pi-info.service not running", "typixdeck-pi-info 服务未运行"));
+        return;
+    }
+    int tw = (w - 34 - 4 * 10) / 5, th = h - 62, ty = y + 48, tx = x + 17;
+    if (s_theme == TH_EV) { ty = y + 44; th = h - 56; }
+    // CPU
+    float t = pi_info_get("cpu", v, sizeof(v)) ? strtof(v, NULL) : -1;
+    snprintf(buf, sizeof(buf), t >= 0 ? "%.1f°C" : "--", t);
+    dash_tile(tx, ty, tw, th, tr("CPU TEMP", "核心温度"), buf,
+              t >= 80 ? p->bad : (t >= 70 ? p->warn : p->text));
+    // NVMe
+    snprintf(buf, sizeof(buf), pi_info_get("nvme", v, sizeof(v)) ? "%s°C" : "%s",
+             pi_info_get("nvme", v, sizeof(v)) ? v : tr("N/A", "无"));
+    dash_tile(tx + (tw + 10), ty, tw, th, tr("NVME TEMP", "NVMe 温度"), buf, p->text);
+    // Fan：转速 + 占空比 + 来源（emc2301 / pwmfan）
+    if (pi_info_get("fan", v, sizeof(v))) {
+        snprintf(buf, sizeof(buf), "%s rpm", v);
+        char sub[32] = "";
+        if (pi_info_get("fanpwm", v2, sizeof(v2))) snprintf(sub, sizeof(sub), "%s%%", v2);
+        if (pi_info_get("fansrc", v, sizeof(v)))
+            snprintf(sub + strlen(sub), sizeof(sub) - strlen(sub), "%s%s", sub[0] ? " · " : "", v);
+        dash_tile3(tx + 2 * (tw + 10), ty, tw, th, tr("FAN", "风扇"), buf, p->text, sub, p->dim);
+    } else {
+        dash_tile(tx + 2 * (tw + 10), ty, tw, th, tr("FAN", "风扇"), tr("N/A", "无"), p->text);
+    }
+    // CPU 主频 + 降频状态（人话，不给用户看 0x50005 这种位图）
+    {
+        unsigned bits = pi_info_get("thr", v, sizeof(v)) ? (unsigned)strtoul(v, NULL, 0) : 0;
+        uint16_t scol;
+        const char *st = throttle_text(bits, &scol);
+        if (pi_info_get("freq", v2, sizeof(v2))) snprintf(buf, sizeof(buf), "%s MHz", v2);
+        else                                     snprintf(buf, sizeof(buf), "--");
+        dash_tile3(tx + 3 * (tw + 10), ty, tw, th, tr("CPU CLOCK", "CPU 主频"), buf,
+                   (bits & 0xF) ? scol : p->text, st, scol);
+    }
+    // Model + uptime
+    unsigned long up = pi_info_get("up", v2, sizeof(v2)) ? strtoul(v2, NULL, 10) : 0;
+    if (!pi_info_get("model", v, sizeof(v))) strcpy(v, "PI");
+    if (up >= 3600) snprintf(buf, sizeof(buf), "%s · %luh%02lum", v, up / 3600, (up % 3600) / 60);
+    else            snprintf(buf, sizeof(buf), "%s · %lum%02lus", v, up / 60, up % 60);
+    dash_tile(tx + 4 * (tw + 10), ty, tw, th, tr("PI UPTIME", "Pi 运行"), buf, p->text);
+}
+
+// ---- SENSORS 页：在位探测独立成页（2026-09-11）----
+static void draw_page_sensors(void)
+{
+    const theme_pal_t *p = pal();
+    char buf[96];
+    sensors_probe_maybe();
+    if (s_present_ts_us >= 0)
+        snprintf(buf, sizeof(buf), tr("SENSORS %d/%d · LAST PROBE %ds AGO",
+                                      "传感器在位 %d/%d · 上次探测 %ds 前"),
+                 s_present_ok, (int)N_SENSORS,
+                 (int)((esp_timer_get_time() - s_present_ts_us) / 1000000));
+    else
+        snprintf(buf, sizeof(buf), tr("SENSORS %d/%d · NOT PROBED YET",
+                                      "传感器在位 %d/%d · 尚未探测"),
+                 s_present_ok, (int)N_SENSORS);
+    ui_card(24, CONTENT_Y, 976, 430, p->good, buf);
+    for (int i = 0; i < (int)N_SENSORS; i++) {
+        int col = i % 5, row = i / 5;
+        int x = 41 + col * 190, y = CONTENT_Y + 56 + row * 160, w = 182, h = 146;
+        bool ok = s_present[i];
+        switch (s_theme) {
+        case TH_CYBER:   fb_fill_rect(x, y, w, h, p->card2); fb_rect_outline(x, y, w, h, 1, ok ? p->frame : p->bad); break;
+        case TH_MINIMAL: fb_fill_round_rect(x, y, w, h, 12, p->card2); break;
+        default:         fb_rect_outline(x, y, w, h, 1, ok ? p->frame : p->bad); break;
+        }
+        fb_fill_rect(x + 16, y + 18, 14, 14, ok ? p->good : p->bad);
+        draw_txt_fit(x + 40, y + 12, 24, w - 52, ok ? p->text : p->dim, k_sensors[i].name);
+        char addr[40] = "";
+        for (int a = 0; a < 4 && k_sensors[i].addr[a]; a++)
+            snprintf(addr + strlen(addr), sizeof(addr) - strlen(addr), "%s0x%02X",
+                     a ? "/" : "", k_sensors[i].addr[a]);
+        draw_txt_fit(x + 16, y + 52, 18, w - 32, p->dim, addr);
+        draw_txt_fit(x + 16, y + 82, 22, w - 32, ok ? p->good : p->bad,
+                     ok ? "OK" : "--");
+        if (k_sensors[i].behind_mux)
+            draw_txt_fit(x + 16, y + 112, 16, w - 32, p->dim, "MUX");
+    }
+    draw_txt_fit(40, CONTENT_Y + 448, 18, 944, p->dim,
+                 tr("STC3117 / GT911 SIT BEHIND THE LCD MUX: ONLY REACHABLE WHILE THE ESP HOLDS THE SCREEN.",
+                    "STC3117 / GT911 在 LCD MUX 之后，只有 ESP 持屏时可达。"));
+    draw_txt_fit(40, CONTENT_Y + 476, 18, 944, p->dim,
+                 tr("ES8389 ADDRESS FLOATS 0x10-0x13 (AD1 OPEN). QMI8658 IS NOT FITTED ON 0720.",
+                    "ES8389 地址在 0x10-0x13 漂移（AD1 悬空）。0720 板未贴 QMI8658。"));
+    draw_txt_centered(726, 26, p->dim, tr("PRESS □ TO RETURN TO PI", "按 □ 键返回树莓派画面"));
+}
+
+// ---------------------------------------------------------------------------
+// 电池卡片 = 蓄水池（2026-09-11，按交互稿 1:1）：
+//   进水管 = USB 输入（INA219 U20），出水管 = 系统负载（INA219 U4），
+//   池子水位 = STC3117 SOC，"流入电池" = STC3117 电池电流。
+//   管道里的虚线段按功率成正比流动，水面 2px 细波纹；动画由 ui_dash_anim_tick
+//   以 ~12fps 只重绘管道与水面，整页仍每 500ms 刷新一次数值。
+// 坐标全部相对卡片左上角（bx,by），卡片 648×330。
+// ---------------------------------------------------------------------------
+#define TK_BX 24
+#define TK_BY CONTENT_Y
+#define TANK_X 150
+#define TANK_Y 128
+#define TANK_W 80
+#define TANK_H 176
+#define PIPE_BG 16
+#define PIPE_FG 8
+#define DASH_ON 14
+#define DASH_OFF 12
+
+typedef struct { int x, y; } pt_t;
+static const pt_t k_pipe_in[]  = { {40, 78}, {182, 78}, {190, 86}, {190, 128} };
+static const pt_t k_pipe_out[] = { {230, 270}, {282, 270}, {286, 274}, {286, 298}, {290, 302}, {356, 302} };
+#define N_PIPE_IN  (sizeof(k_pipe_in) / sizeof(k_pipe_in[0]))
+#define N_PIPE_OUT (sizeof(k_pipe_out) / sizeof(k_pipe_out[0]))
+
+static float s_flow_in = 0, s_flow_out = 0, s_wave = 0;   // 动画相位
+static bool s_dirty = false;            // 增量绘制脏标记（ui_maybe_flush 消费）
+static int64_t s_last_flush_us = 0;
+
+static uint16_t water_col(void)  { return s_theme == TH_MINIMAL ? RGB(29, 158, 117) : RGB(20, 120, 90); }
+static uint16_t wave_col(void)   { return C_MINT; }
+static uint16_t pipe_bg_col(void){ return pal()->card2; }
+
+// 沿折线画管道底 + 流动虚线（phase 为像素偏移）
+static void draw_pipe(const pt_t *pts, int n, int ox, int oy, uint16_t fg, float phase, bool active)
+{
+    uint16_t bg = pipe_bg_col();
+    for (int i = 0; i + 1 < n; i++)
+        fb_draw_line(ox + pts[i].x - PIPE_BG / 2, oy + pts[i].y - PIPE_BG / 2,
+                     ox + pts[i + 1].x - PIPE_BG / 2, oy + pts[i + 1].y - PIPE_BG / 2, PIPE_BG, bg);
+    uint16_t col = active ? fg : pal()->dim;
+    // 起点偏移随 phase 增大而前移 → 虚线段沿折线方向（进水管：标注→池子；出水管：池子→外）流动
+    float pos = fmodf(phase, (float)(DASH_ON + DASH_OFF)) - (float)(DASH_ON + DASH_OFF);
+    for (int i = 0; i + 1 < n; i++) {
+        float x0 = pts[i].x, y0 = pts[i].y, dx = pts[i + 1].x - x0, dy = pts[i + 1].y - y0;
+        float len = sqrtf(dx * dx + dy * dy);
+        float t = pos;
+        while (t < len) {
+            float a = t < 0 ? 0 : t, b = t + DASH_ON; if (b > len) b = len;
+            if (b > a) {
+                int ax = (int)(x0 + dx * a / len), ay = (int)(y0 + dy * a / len);
+                int bx2 = (int)(x0 + dx * b / len), by2 = (int)(y0 + dy * b / len);
+                fb_draw_line(ox + ax - PIPE_FG / 2, oy + ay - PIPE_FG / 2,
+                             ox + bx2 - PIPE_FG / 2, oy + by2 - PIPE_FG / 2, PIPE_FG, col);
+            }
+            t += DASH_ON + DASH_OFF;
+        }
+        pos = t - len;   // 相位跨段延续
+    }
+}
+
+// 池子 + 水位 + 波纹 + 百分比（动画 tick 也重画这一块）
+static void draw_tank(const dash_data_t *d, int ox, int oy)
+{
+    const theme_pal_t *p = pal();
+    int x = ox + TANK_X, y = oy + TANK_Y;
+    fb_round_card(x, y, TANK_W, TANK_H, 10, 2, p->frame, p->card2);
+    int soc = d->soc > 0 ? d->soc : 0;
+    int inner_h = TANK_H - 4, top_in = y + 2;
+    int wh = inner_h * soc / 100;
+    int top = top_in + inner_h - wh;
+    if (wh > 0) {
+        if (wh > 18) fb_fill_round_rect(x + 2, top, TANK_W - 4, wh, 9, water_col());
+        else         fb_fill_rect(x + 2, top, TANK_W - 4, wh, water_col());
+        // 水面波纹：2px 正弦
+        for (int i = 0; i < TANK_W - 4; i++) {
+            int wy = top + (int)(sinf((i + s_wave * 3.0f) / 9.0f) * 2.2f + 2.5f);
+            if (wy < top_in) wy = top_in;
+            fb_fill_rect(x + 2 + i, wy - 2, 1, 4, wave_col());
+        }
+    }
+    char buf[16];
+    if (d->soc >= 0) snprintf(buf, sizeof(buf), "%d%%", d->soc);
+    else             snprintf(buf, sizeof(buf), "--%%");
+    int ty = (soc > 20) ? top - 8 : top + 40;
+    if (ty < y + 20) ty = y + 20;
+    if (ty > y + TANK_H - 34) ty = y + TANK_H - 34;
+    // 字落在水里时用白色/池底色对比
+    draw_txt(x + (TANK_W - txt_w(26, buf)) / 2, ty, 26, C_WHITE, buf);
+}
+
+// 动画 tick：只重绘两根管道 + 池子，然后标脏由 ui_maybe_flush 限频推送
+void ui_dash_anim_tick(void)
+{
+    static int64_t last_us = 0;
+    if (s_tab != UI_TAB_DASH || s_theme == TH_EV || !s_fb) return;
+    int64_t now = esp_timer_get_time();
+    if (now - last_us < 80000) return;       // ~12fps
+    last_us = now;
+    const dash_data_t *d = &s_dash_last;
+    float pin = (d->plugged && d->vbus_ok) ? d->vbus_v * d->vbus_a : 0.0f;
+    float pout = d->vbat_ok ? d->vbat_v * d->vbat_a : 0.0f;
+    if (pin < 0) pin = 0;
+    if (pout < 0) pout = 0;
+    s_flow_in  += pin * 0.9f;
+    s_flow_out += pout * 0.9f;
+    s_wave += 1.0f;
+    if (s_draw_mtx) xSemaphoreTake(s_draw_mtx, portMAX_DELAY);
+    draw_pipe(k_pipe_in, N_PIPE_IN, TK_BX, TK_BY, C_MINT, s_flow_in, pin > 0.05f);
+    draw_tank(d, TK_BX, TK_BY);
+    draw_pipe(k_pipe_out, N_PIPE_OUT, TK_BX, TK_BY, pal()->warn, s_flow_out, pout > 0.05f);
+    s_dirty = true;
+    if (s_draw_mtx) xSemaphoreGive(s_draw_mtx);
+}
+
+// 完整电池卡片（静态文字 + 一帧动画元素）
+static void draw_tank_card(const dash_data_t *d)
+{
+    const theme_pal_t *p = pal();
+    char buf[96];
+    int ox = TK_BX, oy = TK_BY;
+    ui_card(ox, oy, 648, 330, p->warn, tr("BATTERY", "电池"));
+
+    // 进水管 + 标注
+    float pin = (d->plugged && d->vbus_ok) ? d->vbus_v * d->vbus_a : 0.0f;
+    draw_pipe(k_pipe_in, N_PIPE_IN, ox, oy, C_MINT, s_flow_in, d->plugged && pin > 0.05f);
+    draw_txt(ox + 40, oy + 100, 14, C_MINT, tr("USB IN", "USB 输入"));
+    if (d->plugged && d->vbus_ok) {
+        snprintf(buf, sizeof(buf), "%.2f W", pin);
+        draw_txt_fit(ox + 40, oy + 120, 22, 104, p->text, buf);
+        snprintf(buf, sizeof(buf), "%.0f mA", d->vbus_a * 1000.0f);
+        draw_txt(ox + 40, oy + 150, 13, p->dim, buf);
+        snprintf(buf, sizeof(buf), "%.2f V", d->vbus_v);
+        draw_txt(ox + 40, oy + 168, 13, p->dim, buf);
+    } else {
+        draw_txt_fit(ox + 40, oy + 120, 22, 104, p->dim, tr("NOT PLUGGED", "未插电"));
+    }
+
+    draw_tank(d, ox, oy);
+    snprintf(buf, sizeof(buf), "%.0f mAh", batt_log_capacity_mah());
+    draw_txt(ox + TANK_X + (TANK_W - txt_w(12, buf)) / 2, oy + 310, 12, p->dim, buf);
+
+    // 出水管 + 标注
+    float pout = d->vbat_ok ? d->vbat_v * d->vbat_a : 0.0f;
+    draw_pipe(k_pipe_out, N_PIPE_OUT, ox, oy, p->warn, s_flow_out, pout > 0.05f);
+    draw_txt(ox + 302, oy + 268, 14, p->warn, tr("SYSTEM LOAD", "系统负载"));
+    if (d->vbat_ok) {
+        snprintf(buf, sizeof(buf), "%.2f W", pout);
+        draw_txt(ox + 366, oy + 286, 24, p->text, buf);
+        snprintf(buf, sizeof(buf), "%.0f mA", d->vbat_a * 1000.0f);
+        draw_txt(ox + 466, oy + 294, 13, p->dim, buf);
+    } else {
+        draw_txt(ox + 366, oy + 286, 24, p->bad, tr("READ FAIL", "读取失败"));
+    }
+
+    // 右列：电压 / 状态 / 净流 / 预计 / 脚注
+    int rx = ox + 330, maxw = ox + 648 - 24 - rx;
+    if (d->vbat_ok) {
+        snprintf(buf, sizeof(buf), "%.3f V", d->vbat_v);
+        draw_txt(rx, oy + 34, 40, p->text, buf);
+    }
+    int st = dash_power_state(d);
+    s_ps = st;
+    float vb = d->vbat_ok ? d->vbat_v : BOARD_BATT_NOMINAL_V;
+    float net_w = d->stc_i_ok ? d->stc_a * vb : (pin - pout);
+    int   net_ma = d->stc_i_ok ? (int)(d->stc_a * 1000.0f) : (int)(net_w / vb * 1000.0f);
+    const char *title; uint16_t col; char l2[96] = "", l3[96] = "";
+    switch (st) {
+    case PS_DISCHARGE:
+        title = tr("DRAINING · ON BATTERY", "放水中 · 电池供电"); col = p->warn;
+        snprintf(l2, sizeof(l2), tr("FROM BATT %.2f W · %d mA", "电池输出 %.2f W · %d mA"), -net_w, -net_ma);
+        break;
+    case PS_CHARGING: {
+        title = tr("FILLING · CHARGING", "蓄水中 · 充电"); col = C_MINT;
+        snprintf(l2, sizeof(l2), tr("INTO BATT +%.2f W · %+d mA", "流入电池 +%.2f W · %+d mA"), net_w, net_ma);
+        if (net_ma > 20 && d->soc > 0) {
+            float rem_h = batt_log_capacity_mah() * (100 - d->soc) / 100.0f / net_ma;
+            snprintf(l3, sizeof(l3), tr("FULL IN %dH %02dM", "预计 %d 小时 %02d 分充满"),
+                     (int)rem_h, (int)((rem_h - (int)rem_h) * 60));
+        }
+        break;
+    }
+    case PS_DEFICIT:
+        title = tr("USB SHORT · BATT FILLS GAP", "供电不足 · 电池补差"); col = p->bad;
+        snprintf(l2, sizeof(l2), tr("BATT FILLS %.2f W · %d mA", "电池补 %.2f W · %d mA"), -net_w, -net_ma);
+        snprintf(l3, sizeof(l3), "%s", tr("USB TOO WEAK, LEVEL FALLING", "USB 不够用，水位在降"));
+        break;
+    default:
+        title = tr("FULL · USB POWERED", "已充满 · USB 供电中"); col = p->good;
+        snprintf(l2, sizeof(l2), "%s", tr("INTO BATT ≈0 W · TRICKLE", "流入电池 ≈0 W · 涓流"));
+        break;
+    }
+    draw_txt_fit(rx, oy + 92, 30, maxw, col, title);
+    draw_txt_fit(rx, oy + 134, 20, maxw, p->text, l2);
+    if (st == PS_DISCHARGE) draw_runtime_estimate(rx, oy + 164, d->soc);
+    else if (l3[0])         draw_txt_fit(rx, oy + 164, 16, maxw, p->text2, l3);
+    if (d->stc_soc >= 0)
+        snprintf(buf, sizeof(buf), tr("STC3117 %.1f%% · CW2015 %d%%", "STC3117 %.1f%% · CW2015 %d%%"),
+                 d->stc_soc, d->cw_soc);
+    else
+        snprintf(buf, sizeof(buf), tr("STC3117 -- · CW2015 %d%%", "STC3117 -- · CW2015 %d%%"), d->cw_soc);
+    draw_txt_fit(rx, oy + 206, 16, maxw, p->dim, buf);
+    float cap = batt_log_capacity_mah();
+    snprintf(buf, sizeof(buf), tr("TOTAL %.0f mAh · LEFT %.0f mAh", "总容量 %.0f mAh · 剩余 %.0f mAh"),
+             cap, d->soc > 0 ? cap * d->soc / 100.0f : 0.0f);
+    draw_txt_fit(rx, oy + 228, 16, maxw, p->dim, buf);
+}
+
 static void draw_page_dash_cards(const dash_data_t *d, uint32_t uptime_s)
 {
     const theme_pal_t *p = pal();
     char buf[64];
     bool term = (s_theme == TH_TERMINAL);
 
-    // ---- 电池卡片（左 2/3）----
-    int bx = 24, by = CONTENT_Y, bw2 = 648, bh2 = 330;
-    ui_card(bx, by, bw2, bh2, p->warn, tr("BATTERY", "电池"));
-    if (d->soc >= 0) {
-        snprintf(buf, sizeof(buf), "%d%%", d->soc);
-        if (term) fb_draw_text(bx + 36, by + 62, buf, 12, d->soc_col);
-        else      draw_txt(bx + 36, by + 44, 110, d->soc_col, buf);
-    } else {
-        if (term) fb_draw_text(bx + 36, by + 62, "--%", 12, p->dim);
-        else      draw_txt(bx + 36, by + 44, 110, p->dim, "--%");
-    }
-    // 电量条
-    {
-        int gx = bx + 36, gy = by + 196, gw = 300, gh = 32;
-        int pct = d->soc > 0 ? d->soc : 0;
-        if (s_theme == TH_MINIMAL) {
-            fb_fill_round_rect(gx, gy + 6, gw, 18, 9, p->card2);
-            if (pct > 0)
-                fb_fill_round_rect(gx, gy + 6, gw * pct / 100, 18, 9, p->accent);
-        } else {
-            fb_segment_bar(gx, gy, gw, gh, 15, pct, d->soc_col, p->card2);
-            if (s_theme == TH_CYBER)
-                fb_rect_outline(gx - 4, gy - 4, gw + 8, gh + 8, 1, p->frame);
-        }
-    }
-    dash_gauge_footnotes(d, bx + 36, by + 252, 20);
-
-    int rx = bx + 360;
-    if (d->vbat_ok) {
-        snprintf(buf, sizeof(buf), "%.3f V", d->vbat_v);
-        if (term) fb_draw_text(rx, by + 48, buf, 5, p->text);
-        else      draw_txt(rx, by + 40, 48, p->text, buf);
-        // 电压下方的大字：优先电池真实电流（STC3117），不可读时退回负载电流
-        int maxw = bx + bw2 - 24 - rx;
-        if (d->stc_i_ok)
-            snprintf(buf, sizeof(buf), tr("BATT %+.0f mA · %+.2f W", "电池 %+.0f mA · %+.2f W"),
-                     d->stc_a * 1000.0f, d->stc_a * d->vbat_v);
-        else
-            snprintf(buf, sizeof(buf), tr("LOAD %.0f mA · %.2f W", "负载 %.0f mA · %.2f W"),
-                     d->vbat_a * 1000.0f, d->vbat_v * d->vbat_a);
-        draw_txt_fit(rx, by + 108, 26, maxw, p->text2, buf);
-        dash_power_status(d, rx, by + 150, maxw);
-    } else {
-        draw_txt(rx, by + 100, 30, p->bad, tr("INA219 READ FAIL", "INA219 读取失败"));
-    }
+    // ---- 电池卡片（左 2/3）= 蓄水池 ----
+    draw_tank_card(d);
 
     // ---- USB 供电卡片（右 1/3）----
     int ux = 688, uy = CONTENT_Y, uw = 312, uh = 330;
@@ -1240,15 +1540,8 @@ static void draw_page_dash_cards(const dash_data_t *d, uint32_t uptime_s)
         draw_txt(ux + 28, uy + 100, 26, p->bad, tr("READ FAIL", "读取失败"));
     }
 
-    // ---- 传感器在位卡片（底部全宽）----
-    snprintf(buf, sizeof(buf), tr("SENSORS %d/%d", "传感器在位 %d/%d"),
-             s_present_ok, (int)N_SENSORS);
-    ui_card(24, CONTENT_Y + 346, 976, 214, p->good, buf);
-    for (int i = 0; i < (int)N_SENSORS; i++) {
-        int col = i % 5, row = i / 5;
-        dash_sensor_chip(41 + col * 190, CONTENT_Y + 346 + 52 + row * 76,
-                         182, 62, i);
-    }
+    // ---- Pi 遥测卡片（底部全宽；传感器在位已独立成 SENSORS 页）----
+    dash_telemetry_card(24, CONTENT_Y + 346, 976, 214);
     dash_footer(uptime_s);
 }
 
@@ -1311,18 +1604,8 @@ static void draw_page_dash_ev(const dash_data_t *d, uint32_t uptime_s)
                  d->plugged ? p->good : p->dim, st);
     }
 
-    // 底部 telltale 传感器块
-    snprintf(buf, sizeof(buf), tr("SENSORS %d/%d", "传感器在位 %d/%d"),
-             s_present_ok, (int)N_SENSORS);
-    draw_txt(36, 556, 20, p->dim, buf);
-    for (int i = 0; i < (int)N_SENSORS; i++) {
-        int x = 36 + i * 96, y = 586;
-        bool ok = s_present[i];
-        fb_fill_round_rect(x, y, 88, 66, 10, p->card);
-        fb_rect_outline(x, y, 88, 66, 1, ok ? p->frame : p->bad);
-        fb_fill_rect(x + 38, y + 44, 12, 12, ok ? p->good : p->bad);
-        fb_draw_text(x + 8, y + 14, k_sensors[i].name, 1, ok ? p->text2 : p->bad);
-    }
+    // 底部：Pi 遥测块（传感器在位已独立成 SENSORS 页）
+    dash_telemetry_card(36, 556, 952, 150);
     dash_footer(uptime_s);
 }
 
@@ -1330,7 +1613,6 @@ static void draw_page_dash(uint32_t uptime_s)
 {
     dash_data_t d;
     dash_read(&d);
-    sensors_probe_maybe();
     if (s_theme == TH_EV) draw_page_dash_ev(&d, uptime_s);
     else                  draw_page_dash_cards(&d, uptime_s);
 }
@@ -1556,9 +1838,13 @@ static void draw_page_pisig(void)
                 draw_txt(tx, ty, 22, p->text2, buf); ty += tdy;
             }
             if (pi_info_get("thr", v, sizeof(v))) {
-                bool bad = strcmp(v, "0x0") != 0;
-                snprintf(buf, sizeof(buf), tr("THROTTLED: %s", "降频标志: %s"), v);
-                draw_txt(tx, ty, 22, bad ? p->warn : p->text2, buf); ty += tdy;
+                uint16_t scol;
+                const char *st = throttle_text((unsigned)strtoul(v, NULL, 0), &scol);
+                if (pi_info_get("freq", v2, sizeof(v2)))
+                    snprintf(buf, sizeof(buf), tr("CPU CLOCK: %s MHz · %s", "CPU 主频: %s MHz · %s"), v2, st);
+                else
+                    snprintf(buf, sizeof(buf), tr("CPU CLOCK: -- · %s", "CPU 主频: -- · %s"), st);
+                draw_txt(tx, ty, 22, scol == p->good ? p->text2 : scol, buf); ty += tdy;
             }
             if (pi_info_get("load", v, sizeof(v))) {
                 snprintf(buf, sizeof(buf), tr("LOAD: %s", "负载: %s"), v);
@@ -1693,6 +1979,7 @@ void ui_page_draw(uint32_t uptime_s)
     case UI_TAB_BATT:  draw_page_batt(); break;
     case UI_TAB_TOUCH: draw_page_touch(); break;
     case UI_TAB_PISIG: draw_page_pisig(); break;
+    case UI_TAB_SENSORS: draw_page_sensors(); break;
     case UI_TAB_SETUP: draw_page_setup(); break;
     default: break;
     }
@@ -1700,8 +1987,6 @@ void ui_page_draw(uint32_t uptime_s)
     fb_flush();
 }
 
-static bool s_dirty = false;
-static int64_t s_last_flush_us = 0;
 
 void ui_maybe_flush(void)
 {

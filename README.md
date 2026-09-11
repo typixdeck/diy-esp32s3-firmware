@@ -45,3 +45,29 @@ Prebuilt images are under `release/`.
 
 MIT — see [LICENSE](LICENSE). Third-party components under `components/` and
 `managed_components/` keep their own licenses.
+
+## Building from a fresh clone
+
+`managed_components/espressif__esp_codec_dev/` only tracks our patched ES8389
+driver files, so the component manager sees a partial directory and refuses to
+run (`File .component_hash or CHECKSUMS.json ... does not exist`). Once:
+
+```bash
+cp -r managed_components/espressif__esp_codec_dev/device /tmp/es8389_patch
+rm -rf managed_components/espressif__esp_codec_dev build
+idf.py set-target esp32s3          # downloads esp_codec_dev 1.6.2 + .component_hash
+cp -r /tmp/es8389_patch/* managed_components/espressif__esp_codec_dev/device/
+idf.py build
+```
+
+Full flash image (bootloader + partition table + app + font partition):
+
+```bash
+python -m esptool --chip esp32s3 merge_bin -o release/typixdeck_esp32s3_full_$(date +%Y%m%d).bin \
+  --flash_mode dio --flash_size 8MB --flash_freq 80m \
+  0x0 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin \
+  0x10000 build/typixdeck_esp32s3_lcd_init_touch_gui_uac_cdc.bin 0x210000 fonts/puhui_subset.ttf
+```
+
+`tools/gen_charset.py` regenerates `fonts/charset.txt` from the UI strings
+(EN / 简体 / 繁體 / 日本語) before re-subsetting Alibaba PuHuiTi 3.0.
