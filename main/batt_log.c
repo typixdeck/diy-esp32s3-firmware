@@ -143,6 +143,8 @@ static void batt_log_task(void *arg)
         }
         float bus_v = 0, bus_a = 0;
         if (s_ina_bus && ina219_read(s_ina_bus, &bus_v, &bus_a) == ESP_OK) {
+            s.bus_mv = (uint16_t)(bus_v * 1000.0f + 0.5f);
+            s.bus_ma = (int16_t)(bus_a * 1000.0f);
             s.plugged = bus_v > 4.0f;   // 与 UI 的"插电"阈值一致
         }
         // 主 SOC：STC3117（走 MUX，Pi 持屏时读失败是常态，静默回退）

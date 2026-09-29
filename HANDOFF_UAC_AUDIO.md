@@ -30,7 +30,7 @@ TypixDeck 0720 板上 **ESP32-S3-PICO-1 ↔ ES8389 codec** 的 USB UAC 声卡固
   - USB **UAC2 speaker + CDC ACM** composite
   - CDC 收 `REBOOT_TO_BOOT_MODE` 魔串 → 写 RTC `FORCE_DOWNLOAD_BOOT` + `esp_restart()` → 进下载模式
 - **编译**：ESP-IDF **v5.4.2**（`~/esp/esp-idf`），目标 esp32s3，Flash 8MB，PSRAM 八线 120MHz。
-- **刷机**：macOS 编译，scp 到 **Pi（`pi@192.168.3.84`，`/dev/ttyACM0`）**，用 `~/.venv/esptool/bin/esptool`（v5.3.1，Pi 系统的 esptool 坏的——缺 stub json）。Mac 走 USB hub 刷会中途掉，必须走 Pi。
+- **刷机**：macOS 编译，scp 到 **Pi（`pi@raspberrypi.local`，`/dev/ttyACM0`）**，用 `~/.venv/esptool/bin/esptool`（v5.3.1，Pi 系统的 esptool 坏的——缺 stub json）。Mac 走 USB hub 刷会中途掉，必须走 Pi。
 
 ---
 
@@ -167,26 +167,26 @@ firmware/typixdeck_esp32s3_lcd_init_touch_gui_uac_cdc/
 
 ```bash
 # 编译（Mac）
-export IDF_PATH=/Users/eggfly/esp/esp-idf && source $IDF_PATH/export.sh
+export IDF_PATH=$HOME/esp/esp-idf && source $IDF_PATH/export.sh
 cd ~/github/eggfly/TypixDeck/firmware/typixdeck_esp32s3_lcd_init_touch_gui_uac_cdc
 idf.py build
-scp build/typixdeck_esp32s3_lcd_init_touch_gui_uac_cdc.bin pi@192.168.3.84:~/tdflash/
+scp build/typixdeck_esp32s3_lcd_init_touch_gui_uac_cdc.bin pi@raspberrypi.local:~/tdflash/
 
 # 刷机（Pi）—— ESP 在跑 UAC 固件时，用 CDC 魔串进下载模式（plan B）：
-ssh pi@192.168.3.84 'python3 -c "import serial,time; s=serial.Serial(\"/dev/ttyACM0\",115200); s.write(b\"REBOOT_TO_BOOT_MODE\r\n\"); time.sleep(0.5)"'
+ssh pi@raspberrypi.local 'python3 -c "import serial,time; s=serial.Serial(\"/dev/ttyACM0\",115200); s.write(b\"REBOOT_TO_BOOT_MODE\r\n\"); time.sleep(0.5)"'
 sleep 3
-ssh pi@192.168.3.84 '~/.venvs/esptool/bin/esptool --chip esp32s3 -p /dev/ttyACM0 -b 460800 --before default_reset --after hard_reset write_flash 0x10000 ~/tdflash/typixdeck_esp32s3_lcd_init_touch_gui_uac_cdc.bin'
+ssh pi@raspberrypi.local '~/.venvs/esptool/bin/esptool --chip esp32s3 -p /dev/ttyACM0 -b 460800 --before default_reset --after hard_reset write_flash 0x10000 ~/tdflash/typixdeck_esp32s3_lcd_init_touch_gui_uac_cdc.bin'
 # （ESP 死锁卡死、CDC 不通时，手动按 BOOT+RESET 进下载模式再刷）
 
 # 看主机 UAC 流状态
-ssh pi@192.168.3.84 'cat /proc/asound/card2/stream0'
+ssh pi@raspberrypi.local 'cat /proc/asound/card2/stream0'
 # 看 USB 拓扑
-ssh pi@192.168.3.84 'lsusb -t'
+ssh pi@raspberrypi.local 'lsusb -t'
 # 看 UAC 控制有没有 STALL
-ssh pi@192.168.3.84 'dmesg | grep -iE "1-1.2|set_interface|clock|freq|cannot" | tail'
+ssh pi@raspberrypi.local 'dmesg | grep -iE "1-1.2|set_interface|clock|freq|cannot" | tail'
 
 # 抓 CDC 日志（ESP 侧 cdc_printf 出来的，要主机开着 /dev/ttyACM0 才 tud_cdc_connected）
-ssh pi@192.168.3.84 '~/.venvs/esptool/bin/python -c "import serial,time,sys; s=serial.Serial(\"/dev/ttyACM0\",115200,timeout=0.5); [sys.stdout.write(s.read(4096).decode(\"utf-8\",\"replace\")) or sys.stdout.flush() for _ in iter(lambda: time.time()<time.time()+15, False)]"'
+ssh pi@raspberrypi.local '~/.venvs/esptool/bin/python -c "import serial,time,sys; s=serial.Serial(\"/dev/ttyACM0\",115200,timeout=0.5); [sys.stdout.write(s.read(4096).decode(\"utf-8\",\"replace\")) or sys.stdout.flush() for _ in iter(lambda: time.time()<time.time()+15, False)]"'
 ```
 
 ---

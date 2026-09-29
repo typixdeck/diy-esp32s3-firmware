@@ -5,6 +5,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stddef.h>
 #include "driver/i2c_master.h"
 
 esp_err_t ina219_read(i2c_master_dev_handle_t dev, float *bus_v, float *cur_a);
@@ -16,3 +17,5 @@ esp_err_t stc3117_read(i2c_master_dev_handle_t dev, float *v, float *soc);
 esp_err_t stc3117_read_current(i2c_master_dev_handle_t dev, float *cur_a);
 // POR 后 STC3117 处于 standby（读数冻结），置 GG_RUN 启动连续转换（幂等）
 void stc3117_ensure_running(i2c_master_dev_handle_t dev);
+
+size_t sensors_format_diagnostics(i2c_master_dev_handle_t stc, i2c_master_dev_handle_t cw, char *out, size_t capacity);

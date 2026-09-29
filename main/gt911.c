@@ -204,27 +204,28 @@ esp_err_t gt911_raw_status(i2c_master_dev_handle_t dev, uint8_t *status)
 
 esp_err_t gt911_read(i2c_master_dev_handle_t dev, gt911_touch_t *t)
 {
+    if (!t) return ESP_ERR_INVALID_ARG;
+    memset(t, 0, sizeof(*t));
     uint8_t status = 0;
     esp_err_t err = reg_read(dev, REG_STATUS, &status, 1);
-    if (err != ESP_OK) {
-        return err;
-    }
-    if (!(status & 0x80)) {
-        // 参考 esp_lcd_touch_gt911：即使无数据也清一次状态，保持与官方驱动一致
-        reg_write_u8(dev, REG_STATUS, 0);
-        return ESP_ERR_NOT_FOUND;  // 无新数据
-    }
-
+    if (err != ESP_OK) return err;
+    /* No fresh report is not a release. Do not clear a report that can arrive
+       between this read and a needless write of zero. */
+    if (!(status & 0x80)) return ESP_ERR_NOT_FOUND;
     t->count = status & 0x0F;
+    if (t->count > 5) {
+        reg_write_u8(dev, REG_STATUS, 0);
+        t->count = 0;
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     if (t->count > 0) {
-        // 每个触点 8 字节：track_id, xL, xH, yL, yH, sizeL, sizeH, rsv
-        uint8_t p[8] = { 0 };
-        err = reg_read(dev, REG_POINT0, p, 8);
+        uint8_t point[8] = {0};
+        err = reg_read(dev, REG_POINT0, point, sizeof(point));
         if (err == ESP_OK) {
-            t->x = p[1] | (p[2] << 8);
-            t->y = p[3] | (p[4] << 8);
+            t->x = point[1] | (point[2] << 8);
+            t->y = point[3] | (point[4] << 8);
         }
     }
-    reg_write_u8(dev, REG_STATUS, 0);  // 清状态，准备下一帧
-    return ESP_OK;
+    esp_err_t ack = reg_write_u8(dev, REG_STATUS, 0);
+    return err != ESP_OK ? err : ack;
 }

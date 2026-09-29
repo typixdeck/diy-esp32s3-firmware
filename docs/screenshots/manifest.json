@@ -1,0 +1,42 @@
+{
+  "kind": "host-framebuffer-preview",
+  "hardware_verified": false,
+  "firmware_version": "0.4.1",
+  "fixtures": "Synthetic sensor, network, clock, audio and Raspberry Pi state. No hardware or network access.",
+  "renderers": {
+    "main/ui.c": "c0b78495777a69fbf612e4e9cf202afdb4d3620eb6b654eb907a8f65f67f10db",
+    "main/ttf_font.c": "4efc4ca5f2895bfc735ec33c1d1d44dfa4278c5d28b4bc31f92ff50893452ef8"
+  },
+  "images": [
+    "apps-dark.png",
+    "clock-dark.png",
+    "firmware-dark.png",
+    "firmware-light.png",
+    "firmware-pink-dark.png",
+    "firmware-pink-light.png",
+    "firmware-purple-dark.png",
+    "input-history-dark.png",
+    "instrument-dark.png",
+    "instrument-held-dark.png",
+    "interfaces-dark.png",
+    "password-light.png",
+    "pi-dark.png",
+    "pi-file-dark.png",
+    "pi-files-dark.png",
+    "pi-share-error-dark.png",
+    "power-history-dark.png",
+    "sensors-dark.png",
+    "sensors-english-dark.png",
+    "sensors-hour-dark.png",
+    "sensors-light.png",
+    "sensors-unavailable-dark.png",
+    "settings-custom-dark.png",
+    "settings-dark.png",
+    "settings-japanese-dark.png",
+    "settings-light.png",
+    "time-dark.png",
+    "time-light.png",
+    "wifi-dark.png",
+    "wifi-light.png"
+  ]
+}

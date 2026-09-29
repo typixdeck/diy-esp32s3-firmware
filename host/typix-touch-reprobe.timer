@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry missing GT911 touch registration after boot
+
+[Timer]
+OnBootSec=15
+OnUnitInactiveSec=30
+AccuracySec=5
+Unit=typix-touch-reprobe.service
+
+[Install]
+WantedBy=timers.target

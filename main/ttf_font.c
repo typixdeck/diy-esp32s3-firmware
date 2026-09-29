@@ -159,6 +159,15 @@ bool ttf_font_ready(void)
     return s_ready;
 }
 
+bool ttf_text_supported(const char *utf8)
+{
+    if (!s_ready || !s_face || !utf8) return false;
+    for (const char *p = utf8; *p;) {
+        if (FT_Get_Char_Index(s_face, utf8_next(&p)) == 0) return false;
+    }
+    return true;
+}
+
 // RGB565 alpha 混合：dst = dst + (fg-dst)*a/255（逐通道）
 static inline uint16_t blend565(uint16_t dst, uint16_t fg, uint8_t a)
 {

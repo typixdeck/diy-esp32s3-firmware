@@ -14,6 +14,9 @@
 esp_err_t ttf_font_init(void);
 
 bool ttf_font_ready(void);
+// Check primary-face glyph coverage without allocating/rendering glyph bitmaps.
+// Translation selection may fall back when a bundled subset lacks characters.
+bool ttf_text_supported(const char *utf8);
 
 // 在 fb（fb_w×fb_h RGB565）的 (x,y) 处画 UTF-8 文本，y 为文本行顶部。
 // size 为像素字号（任意值，矢量缩放）。返回绘制后的 x 前进量（像素宽）。
@@ -23,7 +26,7 @@ int ttf_draw_text(uint16_t *fb, int fb_w, int fb_h,
 // 文本像素宽（不画，用于居中/右对齐）
 int ttf_text_width(int size, const char *utf8);
 
-// ---- 第二字面（2026-09-10）：开机画面字标用 Special Elite（打字机体，OFL），
+// ---- 第二字面（2026-09-10）：开机画面字标用 Special Elite（打字机体，Apache 2.0），
 //      子集 TTF 内嵌在 app 里（fonts/special_elite_subset.ttf，EMBED_FILES）----
 #define TTF_FACE_MAIN   0     // 阿里巴巴普惠体（font 分区）
 #define TTF_FACE_DECO   1     // Special Elite（app 内嵌，仅拉丁）
@@ -36,4 +39,3 @@ bool ttf_face_ready(int face);
 int ttf_draw_text_face(int face, uint16_t *fb, int fb_w, int fb_h,
                        int x, int y, int size, int spacing, uint16_t color, const char *utf8);
 int ttf_text_width_face(int face, int size, int spacing, const char *utf8);
-

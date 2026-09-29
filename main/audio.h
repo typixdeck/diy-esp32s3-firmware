@@ -5,7 +5,8 @@
 #include "driver/i2c_master.h"
 #include "esp_codec_dev.h"
 
-void audio_start(i2c_master_bus_handle_t bus);
+// Optional service: failure leaves both handles NULL and must not abort boot.
+esp_err_t audio_start(i2c_master_bus_handle_t bus);
 esp_codec_dev_handle_t audio_codec_handle(void);      // 放音（OUT）设备：write / 音量 / mute
 esp_codec_dev_handle_t audio_codec_in_handle(void);   // 录音（IN）设备：read / 麦克风增益
 int audio_set_dac_lr_swap(bool swap);                  // 外放左右反接补偿（REG0x44 bit5:4）

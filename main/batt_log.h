@@ -11,6 +11,8 @@
 #define BATT_LOG_CAP         720   // 720 × 5s = 1 小时
 
 typedef struct {
+    uint16_t bus_mv; // USB input; zero means unavailable
+    int16_t bus_ma;
     uint16_t mv;      // 电池电压 mV（INA219 VBAT bus voltage）
     int16_t  ma;      // 电流 mA（正=放电）
     int8_t   soc;     // SOC %（主 STC3117，读不到回退 CW2015），-1=都失败

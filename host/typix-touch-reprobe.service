@@ -1,0 +1,13 @@
+[Unit]
+Description=Retry an unbound DT-declared GT911 after shared I2C becomes available
+ConditionPathExists=/sys/bus/i2c/drivers/Goodix-TS
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/lib/typixdeck/touch_reprobe.py
+User=root
+NoNewPrivileges=yes
+PrivateNetwork=yes
+ProtectHome=yes
+ProtectSystem=full
+TimeoutStartSec=8

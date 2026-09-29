@@ -39,7 +39,12 @@
 #include "batt_log.h"
 #include "vsync_mon.h"
 #include "ui.h"
+#include "net_service.h"
+#include "instrument.h"
+#include "pi_link.h"
+#include "pi_share.h"
 #include "audio.h"
+#include "boot_diag.h"
 #include "usb_device_uac.h"
 #include "uac_dbg.h"
 #include "tusb.h"
@@ -305,6 +310,7 @@ static void kbd_task(void *arg)
                 online = false;
                 ESP_LOGW(TAG, "键盘 I2C 掉线");
                 kbd_log_append("[KBD offline]\r\n");
+                ui_input_lost();
             }
             vTaskDelay(pdMS_TO_TICKS(500));   // 离线（如键盘在 DFU）降频重试
             continue;
@@ -324,11 +330,7 @@ static void kbd_task(void *arg)
                     bool pressed = ev[i] & 0x80;
                     int row = (ev[i] >> 4) & 0x07;
                     int col = ev[i] & 0x0F;
-                    char line[32];
-                    snprintf(line, sizeof(line), "KEY r%d c%d %s\r\n",
-                             row, col, pressed ? "DOWN" : "UP");
-                    kbd_log_append(line);
-                    ESP_LOGI(TAG, "键盘事件 r%d c%d %s", row, col, pressed ? "按下" : "抬起");
+                    ui_key_event(row, col, pressed);
                     if (pressed && row == 0 && col == 1) {
                         s_kbd_toggle_req = true;   // □ 键 → 切屏
                     }
@@ -338,13 +340,12 @@ static void kbd_task(void *arg)
                         // 标准亮度键码，由 Pi 调自己的 GPIO18 PWM）
                         int lv = backlight_adjust(col == 7 ? +1 : -1);
                         ESP_LOGI(TAG, "背光档位 → %d/%d", lv, BL_LEVELS);
-                        snprintf(line, sizeof(line), "[BL %d/%d]\r\n", lv, BL_LEVELS);
-                        kbd_log_append(line);
+
                     }
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(30));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -369,7 +370,7 @@ static esp_err_t uac_output_cb(uint8_t *buf, size_t len, void *ctx)
     s_pcm_bytes += len;
     esp_codec_dev_handle_t codec = audio_codec_handle();
     if (codec) {
-        esp_codec_dev_write(codec, buf, len);
+        instrument_write_usb(buf, len);
     }
     if ((s_pcm_calls % 1000) == 0) {
         ESP_LOGI(TAG, "PCM #%lu calls %lu bytes",
@@ -441,14 +442,14 @@ static void uac_set_mute_cb(uint32_t mute, void *ctx)
 {
     (void)ctx;
     ESP_LOGI(TAG, "host set mute=%lu", (unsigned long)mute);
-    esp_codec_dev_set_out_mute(audio_codec_handle(), (bool)mute);
+    instrument_set_usb_mute((bool)mute);
 }
 static void uac_set_volume_cb(uint32_t volume, void *ctx)
 {
     (void)ctx;
     int vol = (int)volume; if (vol > 100) vol = 100;
     ESP_LOGI(TAG, "host set volume=%lu -> codec %d", (unsigned long)volume, vol);
-    esp_codec_dev_set_out_vol(audio_codec_handle(), vol);
+    instrument_set_usb_volume(vol);
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +460,11 @@ static volatile bool s_audio_dump = false;       // AUDIO_DUMP：打印功放/�
 static volatile int  s_amp_force = 0;            // AMP_ON=1 / AMP_OFF=-1（诊断用，stats 任务消费后清零）
 static volatile bool s_screenshot = false;       // SCREENSHOT：回传 1024×768 RGB565 帧缓冲
 static volatile bool s_aw_dump = false;          // AW_DUMP：AW9523 开机取证快照 + 实时寄存器
+static volatile bool s_boot_status = false;
+static volatile bool s_wifi_status = false;
+static volatile bool s_share_status, s_battery_status;
+static volatile int s_share_action;
+static volatile int s_wifi_action = 0; // fixed maintenance commands: on/off/scan
 
 // HP_DET 插拔事件（hp_amp_task 生产，两处消费）：
 //   - cdc_stats_task 打印 "HP_DET changed: x->y"（s_hp_cdc_event 消费后清零）；
@@ -474,15 +480,41 @@ void tud_cdc_rx_cb(uint8_t itf)
     (void)itf;
     static char line[160];   // PI_INFO 遥测行可到 ~120 字节
     static size_t pos = 0;
+    static bool discard = false;
     while (tud_cdc_available()) {
         char c;
         if (tud_cdc_read(&c, 1) == 0) break;
         if (c == '\r' || c == '\n') {
+            if (discard) { pos=0; discard=false; memset(line,0,sizeof(line)); continue; }
             line[pos] = '\0';
-            if (pos && strstr(line, "PI_INFO ")) {
+            if (pos && !strncmp(line, "TDPAIR ", 7)) {
+                pi_share_receive(line);
+            } else if (pos && !strncmp(line, "TD1 ", 4)) {
+                pi_link_receive(line);
+            } else if (pos && strstr(line, "PI_INFO ")) {
                 ui_set_pi_info(strstr(line, "PI_INFO ") + 8);     // Pi 端 systemd 遥测
             } else if (pos && strstr(line, "REBOOT_TO_BOOT_MODE")) {
                 s_reboot_to_boot = true;
+            } else if (!strcmp(line, "BOOT_STATUS")) {
+                s_boot_status = true;
+            } else if (!strcmp(line, "WIFI_STATUS")) {
+                s_wifi_status = true;
+            } else if (!strcmp(line, "SHARE_STATUS")) {
+                s_share_status=true;
+            } else if (!strcmp(line, "BATTERY_STATUS")) {
+                s_battery_status=true;
+            } else if (!strcmp(line, "SHARE_LIST")) {
+                s_share_action=1;
+            } else if (!strcmp(line, "SHARE_SCREEN")) {
+                s_share_action=2;
+            } else if (!strcmp(line, "SHARE_FILE_0")) {
+                s_share_action=3;
+            } else if (!strcmp(line, "WIFI_ON")) {
+                s_wifi_action = 1;
+            } else if (!strcmp(line, "WIFI_OFF")) {
+                s_wifi_action = 2;
+            } else if (!strcmp(line, "WIFI_SCAN")) {
+                s_wifi_action = 3;
             } else if (pos && strstr(line, "AUDIO_DUMP")) {
                 s_audio_dump = true;
             } else if (pos && strstr(line, "AW_DUMP")) {
@@ -493,8 +525,6 @@ void tud_cdc_rx_cb(uint8_t itf)
                 s_amp_force = -1;
             } else if (pos && strstr(line, "SCREENSHOT")) {
                 s_screenshot = true;
-            } else if (pos && strstr(line, "THEME_")) {
-                ui_request_theme(strstr(line, "THEME_")[6] - '0');   // 远程验证 UI 用
             } else if (pos && strstr(line, "TAB_")) {
                 ui_request_tab(strstr(line, "TAB_")[4] - '0');
             } else if (pos && strstr(line, "LANG_")) {
@@ -503,9 +533,10 @@ void tud_cdc_rx_cb(uint8_t itf)
                 s_kbd_toggle_req = true;                             // 等价 □ 键/SW3
             }
             pos = 0;
-        } else if (pos < sizeof(line) - 1) {
+            memset(line,0,sizeof(line));
+        } else if (!discard && (unsigned char)c >= 32 && (unsigned char)c <= 126 && pos < sizeof(line) - 1) {
             line[pos++] = c;
-        }
+        } else { discard=true; }
     }
 }
 
@@ -677,9 +708,56 @@ static void cdc_stats_task(void *arg)
             }
         }
 
+        if (s_wifi_action) {
+            int action = s_wifi_action;
+            s_wifi_action = 0;
+            if (action == 3) net_service_scan();
+            else net_service_set_enabled(action == 1);
+            s_wifi_status = true;
+        }
         if (!tud_cdc_connected()) {
             greeted = false;
             continue;
+        }
+        // One bounded record on connect/request. Backpressure keeps it pending.
+        if ((!greeted || s_boot_status) && tud_cdc_write_available() >= sizeof(buf)) {
+            size_t n = boot_diag_format(buf, sizeof(buf));
+            tud_cdc_write(buf, (uint32_t)n);
+            tud_cdc_write_flush();
+            s_boot_status = false;
+        } else if (!greeted) {
+            s_boot_status = true;
+        }
+        if (s_wifi_status && tud_cdc_write_available() >= sizeof(buf)) {
+            size_t n = net_service_format_diagnostics(buf, sizeof(buf));
+            tud_cdc_write(buf, (uint32_t)n);
+            tud_cdc_write_flush();
+            s_wifi_status = false;
+        }
+        if (s_share_action) {
+            int action=s_share_action; s_share_action=0;
+            if (action==1) pi_share_request(SHARE_LIST,NULL);
+            else if (action==2) pi_share_request(SHARE_SCREEN,NULL);
+            else { pi_share_snapshot_t snap; pi_share_get_snapshot(&snap);
+                if(snap.count) pi_share_request(SHARE_FILE,snap.files[0].name); }
+            s_share_status=true;
+        }
+        if (s_share_status && tud_cdc_write_available() >= sizeof(buf)) {
+            size_t n=pi_share_format_diagnostics(buf,sizeof(buf));
+            tud_cdc_write(buf,n);tud_cdc_write_flush();s_share_status=false;
+        }
+        if (s_battery_status && tud_cdc_write_available() >= sizeof(buf)) {
+            size_t n=sensors_format_diagnostics(s_stc3117,s_cw2015,buf,sizeof(buf));
+            tud_cdc_write(buf,n);tud_cdc_write_flush();s_battery_status=false;
+        }
+        char pi_tx[160];
+        if (tud_cdc_write_available() >= sizeof(pi_tx) && pi_link_take_tx(pi_tx, sizeof(pi_tx))) {
+            tud_cdc_write(pi_tx, strlen(pi_tx));
+            tud_cdc_write_flush();
+        }
+        if (tud_cdc_write_available() >= sizeof(pi_tx) && pi_share_take_tx(pi_tx, sizeof(pi_tx))) {
+            tud_cdc_write(pi_tx, strlen(pi_tx));
+            tud_cdc_write_flush();
         }
         if (s_audio_dump) {
             s_audio_dump = false;
@@ -745,7 +823,7 @@ static void cdc_stats_task(void *arg)
             (unsigned long)cur.mount,
             (unsigned long)cur.suspend);
         if (n > 0) {
-            tud_cdc_write(buf, (uint32_t)n);
+            tud_cdc_write(buf, (uint32_t)((size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1));
             tud_cdc_write_flush();
         }
         prev = cur;
@@ -757,12 +835,16 @@ static void cdc_stats_task(void *arg)
 }
 
 // audio(ES8389) + USB(UAC+CDC) 初始化放独立任务跑：esp_codec_dev + tusb_init
-// 调用栈深，app_main 的 8KB 栈会溢出 → 崩溃重启循环（lcd_mp3 也是独立任务跑的）
+// 独立任务保留 16KB 栈；可选音频失败不能阻止 USB 维护接口启动。
 static void audio_usb_task(void *arg)
 {
     i2c_master_bus_handle_t bus = (i2c_master_bus_handle_t)arg;
 
-    audio_start(bus);
+    boot_diag_stage(BOOT_AUDIO, AUDIO_START);
+    boot_diag_stage(BOOT_AUDIO, AUDIO_CODEC);
+    esp_err_t audio_err = audio_start(bus);
+    if (audio_err == ESP_OK) audio_err = instrument_start(audio_codec_handle());
+    boot_diag_audio_result(audio_err);
 
     // non-AS_PART：组件自带描述符，itf 号由组件内部填，不用给 spk_itf_num
     uac_device_config_t uac_cfg = {
@@ -773,13 +855,18 @@ static void audio_usb_task(void *arg)
         .set_volume_cb   = uac_set_volume_cb,
         .cb_ctx          = NULL,
     };
-    if (uac_device_init(&uac_cfg) == ESP_OK) {
+    boot_diag_stage(BOOT_AUDIO, AUDIO_USB);
+    esp_err_t usb_err = uac_device_init(&uac_cfg);
+    if (usb_err == ESP_OK) {
         ESP_LOGI(TAG, "USB UAC+CDC 已启动（48k/16bit/stereo 放音+录音 <-> ES8389 + CDC 统计口）");
         // CDC 统计任务在 tusb_init 之后才启动（优先级低于 tinyusb 任务）
-        xTaskCreate(cdc_stats_task, "cdc_stats", 4096, NULL, 3, NULL);
+        if (xTaskCreate(cdc_stats_task, "cdc_stats", 4096, NULL, 3, NULL) != pdPASS)
+            usb_err = ESP_ERR_NO_MEM;
     } else {
         ESP_LOGE(TAG, "USB UAC 初始化失败");
     }
+    boot_diag_usb_result(usb_err);
+    if (usb_err == ESP_OK) boot_diag_stage(BOOT_AUDIO, AUDIO_READY);
     vTaskDelete(NULL);
 }
 
@@ -919,14 +1006,17 @@ typedef enum {
 
 void app_main(void)
 {
+    boot_diag_init();
     vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "TypixDeck dual-source display switch + power monitor + GUI");
 
+    boot_diag_stage(BOOT_MAIN, BOOT_I2C);
     if (i2c_start() != ESP_OK) {
         ESP_LOGE(TAG, "I2C/AW9523 初始化失败，停止");
         return;
     }
     // MUX 此刻在 ESP 侧（aw9523_init 置 MUX_SEL=1）：完成面板 SPI 初始化
+    boot_diag_stage(BOOT_MAIN, BOOT_LCD);
     if (lcd_reset_and_spi_init() != ESP_OK) {
         ESP_LOGE(TAG, "LCD SPI 初始化失败，停止");
         return;
@@ -939,6 +1029,7 @@ void app_main(void)
     }
     touch_ensure_init();
 
+    boot_diag_stage(BOOT_MAIN, BOOT_RGB);
     if (rgb_panel_start() != ESP_OK) {
         ESP_LOGE(TAG, "RGB 面板启动失败，停止");
         return;
@@ -953,10 +1044,15 @@ void app_main(void)
         .cw2015 = s_cw2015,
         .stc3117 = s_stc3117,
     };
+    boot_diag_stage(BOOT_MAIN, BOOT_UI);
     if (ui_init(s_panel, &ui_ctx) != ESP_OK) {
         ESP_LOGE(TAG, "UI framebuffer 分配失败，停止");
         return;
     }
+    pi_link_init();
+    pi_share_init();
+    boot_diag_stage(BOOT_MAIN, BOOT_SERVICES);
+    ui_process_events();
     ui_boot_anim_tick(0, false);   // 先出 logo 再继续（MUX 已在 ESP 侧）
 
     // VSYNC 探测：必须在 lcd_jd9168s_spi_init 之后（GPIO5 已被 spi_bus_free 释放）
@@ -977,8 +1073,13 @@ void app_main(void)
     xTaskCreate(hp_amp_task, "hp_amp", 4096, NULL, 5, NULL);
 
     // LCD SPI 初始化已完成 → GPIO47/48 现在重配成 I2S。
-    // audio(ES8389) + USB(UAC) 放独立 16KB 任务跑（栈深，避免 app_main 8KB 溢出）
-    xTaskCreate(audio_usb_task, "audio_usb", 16384, s_i2c_bus, 5, NULL);
+    // audio(ES8389) + USB(UAC) 放独立 16KB 任务跑。
+    if (xTaskCreate(audio_usb_task, "audio_usb", 16384, s_i2c_bus, 5, NULL) != pdPASS) {
+        boot_diag_audio_result(ESP_ERR_NO_MEM);
+        boot_diag_usb_result(ESP_ERR_NO_MEM);
+        ESP_LOGE(TAG, "Audio/USB task unavailable");
+    }
+    if (net_service_init() != ESP_OK) ESP_LOGE(TAG, "Wi-Fi service unavailable");
 
     boot_btn_start();
 
@@ -996,9 +1097,8 @@ void app_main(void)
     int anim_frame = 0;
     int64_t boot_ms0 = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
     int64_t last_draw_ms = 0;
-    int64_t hp_grab_until_ms = 0;   // >now 表示 HP_DET 抢屏窗口生效中
-    disp_state_t hp_restore_state = ST_PI;
 
+    boot_diag_stage(BOOT_MAIN, BOOT_RUNNING);
     while (1) {
         int lvl = gpio_get_level(PIN_BOOT_BTN);
         int64_t now_ms = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -1010,39 +1110,9 @@ void app_main(void)
             toggle = true;                            // 键盘 □ 键，与 SW3 等价
         }
 
-        // ---- HP_DET 插拔事件 → ESP 抢屏 2 秒显示状态页，到时恢复 ----
-        // （开机动画阶段忽略：动画本来就在 ESP 侧，别打断）
         if (s_hp_grab_event) {
-            int ev = s_hp_grab_event;
-            s_hp_grab_event = 0;
-            if (state != ST_BOOT_ANIM) {
-                hp_restore_state = state;
-                ui_draw_hp_page(ev == 1 ? 1 : 0, s_mic_rms[0], s_mic_rms[1]);
-                mux_select(true);
-                // 无条件设恢复窗口：即使 MUX 写失败也要按时恢复画面归属，
-                // 不能让 HP 页永久占屏（写失败由健康检查兜底纠正 MUX）
-                hp_grab_until_ms = now_ms + 2000;
-            }
-        }
-        if (hp_grab_until_ms) {
-            if (toggle) {
-                // 手动切换优先：取消抢屏窗口，按原归属翻转
-                hp_grab_until_ms = 0;
-                state = hp_restore_state;
-            } else if (now_ms >= hp_grab_until_ms) {
-                hp_grab_until_ms = 0;
-                state = hp_restore_state;
-                mux_select(state == ST_ESP_UI);
-                if (state == ST_ESP_UI) {
-                    ui_page_draw(now_ms / 1000);
-                    last_draw_ms = now_ms;
-                }
-                vTaskDelay(pdMS_TO_TICKS(50));
-                continue;
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(50));     // 抢屏窗口内不跑其它重绘
-                continue;
-            }
+            int ev=s_hp_grab_event; s_hp_grab_event=0;
+            if (state==ST_ESP_UI) ui_draw_hp_page(ev==1?1:0,s_mic_rms[0],s_mic_rms[1]);
         }
 
         switch (state) {
@@ -1056,7 +1126,7 @@ void app_main(void)
                 state = ST_PI;
                 break;
             }
-            if (toggle) {
+            if (toggle || now_ms - boot_ms0 > 5000) {
                 // Pi 还没出图，用户主动进 ESP GUI（MUX 本来就在 ESP 侧）
                 state = ST_ESP_UI;
                 ui_page_draw(now_ms / 1000);
@@ -1102,12 +1172,12 @@ void app_main(void)
                     } else {
                         ui_handle_touch(0, 0, false);
                     }
-                }
+                } else if (terr != ESP_ERR_NOT_FOUND) { ui_handle_touch(0, 0, false); }
             }
             ui_dash_anim_tick();                   // 仪表盘蓄水池：管道流动 + 水面波纹
             ui_maybe_flush();                      // 触摸轨迹增量冲刷（限频 15Hz）
             if (now_ms - last_draw_ms >= 500) {
-                ui_page_draw(now_ms / 1000);
+                ui_periodic_draw(now_ms / 1000);
                 last_draw_ms = now_ms;
             }
             vTaskDelay(pdMS_TO_TICKS(20));         // 触摸响应 50Hz

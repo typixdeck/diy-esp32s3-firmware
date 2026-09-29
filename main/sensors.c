@@ -1,4 +1,5 @@
 #include "sensors.h"
+#include <stdio.h>
 
 #include "esp_check.h"
 #include "esp_log.h"
@@ -117,4 +118,53 @@ esp_err_t stc3117_read(i2c_master_dev_handle_t dev, float *v, float *soc)
     ESP_RETURN_ON_ERROR(reg8_read(dev, 0x02, b, 2), TAG, "stc soc");
     *soc = (float)(uint16_t)(b[0] | (b[1] << 8)) / 512.0f;
     return ESP_OK;
+}
+
+/* Read the official shared-RAM marker without creating or repairing it.
+ * CRC-8 poly 0x07/init 0, matching the Pi/ESP gauge RAM layout. */
+static uint8_t sensors_diag_crc8(const uint8_t *data, size_t len)
+{
+    uint8_t crc = 0;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+    }
+    return crc;
+}
+
+/* Bounded read-only diagnostics. Never call ensure_running/wake here: those
+ * write the gauges and would destroy evidence of standby/POR/battery-swap.
+ * A second request after >= 4 seconds can establish whether counter advances.
+ * STC3117 is reachable only while the existing MUX owner is the ESP. */
+size_t sensors_format_diagnostics(i2c_master_dev_handle_t stc, i2c_master_dev_handle_t cw,
+                                  char *out, size_t cap)
+{
+    if (!out || !cap) return 0;
+    uint8_t b[19] = {0}, ram[16] = {0}, c = 0;
+    float v = 0;
+    int soc = -1;
+    int se = stc ? reg8_read(stc, 0, b, sizeof(b)) : ESP_ERR_INVALID_STATE;
+    int re = se == ESP_OK ? reg8_read(stc, 0x20, ram, sizeof(ram)) : ESP_ERR_INVALID_STATE;
+    int ce = cw ? cw2015_read(cw, &v, &soc) : ESP_ERR_INVALID_STATE;
+    int cm = cw ? reg8_read(cw, 0x0a, &c, 1) : ESP_ERR_INVALID_STATE;
+    int ram_ok = re == ESP_OK ?
+        ((ram[0] | ram[1] << 8) == 0x53a9 && sensors_diag_crc8(ram, sizeof(ram)) == 0) : -1;
+    int seeded = re == ESP_OK ? (ram_ok && ram[10] == 0x5d) : -1;
+    int n = snprintf(out, cap,
+        "TD_BATT v=2 stc_err=%d mode=%d ctrl=%d counter=%d soc_raw=%d mv=%d current_raw=%d "
+        "ocv_raw=%d cc=%d vm=%d ram_err=%d ram_ok=%d seeded=%d "
+        "cw_err=%d cw_mv=%d cw_soc=%d cw_mode=%d\r\n",
+        se, se == ESP_OK ? b[0] : -1, se == ESP_OK ? b[1] : -1,
+        se == ESP_OK ? b[4] | b[5] << 8 : -1, se == ESP_OK ? b[2] | b[3] << 8 : -1,
+        se == ESP_OK ? (int)((int16_t)(b[8] | b[9] << 8) * 2.2f) : -1,
+        se == ESP_OK ? b[6] | b[7] << 8 : -1, se == ESP_OK ? b[13] | b[14] << 8 : -1,
+        se == ESP_OK ? b[15] | b[16] << 8 : -1, se == ESP_OK ? b[17] | b[18] << 8 : -1,
+        re, ram_ok, seeded, ce, ce == ESP_OK ? (int)(v * 1000) : -1,
+        ce == ESP_OK ? soc : -1, cm == ESP_OK ? c : -1);
+    if (n < 0 || (size_t)n >= cap) {
+        out[0] = '\0';                  // Never emit a truncated status record.
+        return 0;
+    }
+    return (size_t)n;
 }

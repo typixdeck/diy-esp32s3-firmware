@@ -17,3 +17,7 @@ managed_components/espressif__esp_codec_dev/device/*
 !managed_components/espressif__esp_codec_dev/device/include/
 managed_components/espressif__esp_codec_dev/device/include/*
 !managed_components/espressif__esp_codec_dev/device/include/es8389_codec.h
+
+# Local Python validation tools
+__pycache__/
+*.py[cod]
