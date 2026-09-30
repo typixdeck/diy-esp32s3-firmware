@@ -5,8 +5,9 @@
 #include "../main/instrument.h"
 #include "../main/pi_link.h"
 static int preview_text(uint16_t *, int, int, int, int, int, uint16_t, const char *);
+static time_t preview_epoch = 1789389000;
 static time_t preview_time(time_t *out) {
-    time_t t = 1789389000;
+    time_t t = preview_epoch;
     if (out)
         *out = t;
     return t;
@@ -535,6 +536,108 @@ static void behavior_tests(void) {
          "keyboard repeat, overflow/MUX cleanup and gating, shutdown confirmation, password "
          "masking/cancellation.");
 }
+static void tap_key(int row, int col) { key(row, col, true); key(row, col, false); }
+static void app_ui_tests(const char *dir) {
+    change_tab(UI_TAB_APPS);
+    draw();
+    /* Every app is reachable from the physical Tab sequence and opens with Enter. */
+    const int apps[] = {ACT_INSTRUMENT, ACT_CLOCK, ACT_CALCULATOR, ACT_CALENDAR, ACT_GAME};
+    for (int i = 0; i < 5; i++) {
+        change_tab(UI_TAB_APPS); draw();
+        int steps = 0;
+        do { tap_key(2, 0); steps++; assert(steps <= s_button_count); }
+        while (s_buttons[s_focus].id != apps[i]);
+        tap_key(3, 10); assert(s_app == i + 1);
+        key(3, 0, true); tap_key(2, 0); key(3, 0, false);
+        assert(!s_app && !fixture_instrument.active);
+    }
+    click_id(ACT_CALCULATOR);
+    click_id(ACT_CALC_CLEAR); click_id(ACT_CALC_CHAR + '1');
+    key(5, 0, true); tap_key(2, 8); key(5, 0, false); /* Sym + */
+    tap_key(1, 1); tap_key(3, 10);
+    assert(!strcmp(s_calculator.result, "3"));
+    click_id(ACT_CALC_CLEAR);
+    key(4, 0, true); tap_key(1, 8); key(4, 0, false); /* ( */
+    tap_key(1, 1); click_id(ACT_CALC_CHAR + '+');
+    key(5, 0, true); tap_key(3, 3); key(5, 0, false); /* . */
+    tap_key(1, 4);
+    key(4, 0, true); tap_key(1, 9); tap_key(1, 7); key(4, 0, false); /* ) * */
+    tap_key(1, 3); tap_key(3, 10);
+    assert(!strcmp(s_calculator.input, "(2+.5)*4") && !strcmp(s_calculator.result, "10"));
+    emit(dir, "calculator-dark");
+    s_light = true; palette_update(); emit(dir, "calculator-light");
+    s_light = false; palette_update();
+    click_id(ACT_CALC_CHAR + '/'); click_id(ACT_CALC_CHAR + '0'); click_id(ACT_CALC_EQUALS);
+    assert(s_calculator.error == CALC_DIV_ZERO);
+    emit(dir, "calculator-error-dark");
+    tap_key(1, 10); tap_key(1, 1); tap_key(3, 10);
+    assert(!strcmp(s_calculator.result, "5"));
+    tap_key(4, 3); assert(!s_calculator.input[0]); /* C */
+    click_id(ACT_BACK); click_id(ACT_CALENDAR);
+    s_calendar = (calendar_date_t){2024, 2, 29};
+    click_id(ACT_CAL_NEXT); assert(s_calendar.month == 3);
+    tap_key(5, 8); assert(s_calendar.month == 2);
+    tap_key(4, 9); assert(s_calendar.year == 2023 && s_calendar.day == 28);
+    tap_key(5, 9); assert(s_calendar.year == 2024);
+    preview_epoch = 1735688700; fixture_net.timezone_offset_minutes = 30;
+    tap_key(2, 5); assert(s_calendar.year == 2025 && s_calendar.month == 1 && s_calendar.day == 1);
+    preview_epoch = 1789389000; fixture_net.timezone_offset_minutes = 480;
+    click_id(ACT_CAL_TODAY);
+    emit(dir, "calendar-dark");
+    s_light = true; palette_update(); emit(dir, "calendar-light");
+    s_light = false; palette_update();
+    fixture_net.time_valid = false; s_calendar.year = 0;
+    click_id(ACT_BACK); click_id(ACT_CALENDAR);
+    assert(s_calendar.year == 2000 && s_calendar.month == 1);
+    for (int i = 0; i < s_button_count; i++) if (s_buttons[i].id == ACT_CAL_TODAY) assert(!s_buttons[i].enabled);
+    tap_key(2, 5); assert(s_calendar.year == 2000);
+    click_id(ACT_CAL_NEXT); assert(s_calendar.month == 2);
+    emit(dir, "calendar-unsynced-dark");
+    fixture_net.time_valid = true;
+    click_id(ACT_BACK); click_id(ACT_GAME);
+    s_game = (game2048_t){.cells = {1,1,1,1}, .random = 11};
+    click_id(ACT_GAME_MOVE + GAME_LEFT);
+    assert(s_game.cells[0] == 2 && s_game.cells[1] == 2 && s_game.score == 8);
+    s_game = (game2048_t){.cells = {1,0,0,0,1}, .random = 12};
+    tap_key(2, 2); assert(s_game.cells[0] == 2 && s_game.score == 4); /* W */
+    s_game = (game2048_t){.cells = {1,2,3,4}, .random = 13};
+    game2048_t before = s_game;
+    tap_key(5, 8); assert(!memcmp(&before, &s_game, sizeof(s_game)));
+    tap_key(2, 4); assert(s_game_restart);
+    click_id(ACT_GAME_CANCEL); assert(!s_game_restart && !memcmp(&before, &s_game, sizeof(s_game)));
+    click_id(ACT_GAME_RESTART); focus_id(ACT_GAME_CONFIRM); tap_key(3, 10);
+    assert(!s_game_restart && !s_game.score);
+    s_game = (game2048_t){.cells = {10,10}, .random = 14};
+    tap_key(3, 1); assert(s_game.won && !s_game.continued);
+    before = s_game; tap_key(3, 3); assert(!memcmp(&before, &s_game, sizeof(s_game)));
+    emit(dir, "2048-win-dark");
+    click_id(ACT_GAME_CONTINUE); assert(s_game.continued);
+    tap_key(5, 10); assert(s_game.cells[3] == 11);
+    s_game = (game2048_t){.cells = {1,2,1,2,2,1,2,1,1,2,1,2,2,1,2,1}, .random = 15};
+    tap_key(5, 8); assert(s_game.over);
+    emit(dir, "2048-over-dark");
+    s_game = (game2048_t){.cells = {1,2,0,0,2,3,0,0,4,5,6,0,1,2,3,7}, .random = 16, .score = 1536};
+    emit(dir, "2048-dark");
+    s_light = true; palette_update(); emit(dir, "2048-light");
+    s_light = false; palette_update();
+    before = s_game;
+    ui_notify_mux(false); tap_key(5, 8); assert(!memcmp(&before, &s_game, sizeof(s_game)));
+    ui_notify_mux(true);
+    click_id(ACT_BACK); click_id(ACT_GAME); assert(!memcmp(&before, &s_game, sizeof(s_game)));
+    /* All new controls remain in bounds and non-overlapping in both palettes. */
+    for (int light = 0; light < 2; light++) {
+        s_light = light; palette_update();
+        for (int app = 3; app <= 5; app++) {
+            s_app = app; draw();
+            for (int i = 0; i < s_button_count; i++) for (int j = i + 1; j < s_button_count; j++) {
+                button_t a = s_buttons[i], b = s_buttons[j];
+                assert(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
+            }
+        }
+    }
+    s_light = false; palette_update(); change_tab(UI_TAB_SENSORS);
+    puts("Built-in app UI passed: Tab/Enter/Fn+Tab entry/exit, touch + Shift/Sym calculator, month/year/today/unsynced calendar, touch/WASD/arrows 2048, restart confirmation, win/continue/gameover, MUX gating, dark/light bounds.");
+}
 int main(int argc, char **argv) {
     assert(argc == 3);
     FILE *f = fopen(argv[1], "rb");
@@ -570,6 +673,7 @@ int main(int argc, char **argv) {
     ui_set_pi_info("model=CM4 cpu=48.3 freq=1200 up=7200");
     behavior_tests();
     reference_ui_tests();
+    app_ui_tests(argv[2]);
     emit(argv[2], "firmware-dark");
     uint16_t blue_bg=pal()->bg,blue_card=pal()->card,blue_frame=pal()->frame;
     change_tab(UI_TAB_SETUP);click_id(ACT_COLOR+2);change_tab(UI_TAB_SENSORS);

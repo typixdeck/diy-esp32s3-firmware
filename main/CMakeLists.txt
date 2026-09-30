@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS "main.c" "boot_diag.c" "aw9523.c" "gt911.c" "lcd_spi_init.c" "audio.c"
-         "pi_link.c" "pi_share.c" "net_service.c" "instrument.c" "instrument_engine.c" "sensors.c" "stc_gauge.c" "batt_log.c" "vsync_mon.c" "ui.c" "ttf_font.c"
+         "pi_link.c" "pi_share.c" "net_service.c" "instrument.c" "instrument_engine.c" "sensors.c" "stc_gauge.c" "batt_log.c" "vsync_mon.c" "ui.c" "builtin_apps.c" "ttf_font.c"
     INCLUDE_DIRS "."
     EMBED_FILES "../fonts/special_elite_subset.ttf"
     REQUIRES driver esp_lcd esp_timer esp_app_format esp_driver_i2s esp_hw_support usb_device_uac

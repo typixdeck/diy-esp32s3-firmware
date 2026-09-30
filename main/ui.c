@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 
 #include "batt_log.h"
+#include "builtin_apps.h"
 #include "board_pins.h"
 #include "freertos/queue.h"
 #include "i18n.h"
@@ -1008,7 +1009,11 @@ void ui_boot_signal_locked(void) {
 static ui_tab_t s_tab = UI_TAB_SENSORS;
 static uint32_t s_last_uptime_s;
 static bool s_confirm_shutdown;
-static int s_app; /* 0 launcher, 1 instrument, 2 clock */
+static int s_app; /* 0 launcher, 1 instrument, 2 clock, 3 calculator, 4 calendar, 5 2048 */
+static calculator_t s_calculator;
+static calendar_date_t s_calendar;
+static game2048_t s_game;
+static bool s_game_started, s_game_restart;
 static int s_ap_page;
 static int s_settings; /* 0 appearance, 1 Wi-Fi, 2 time */
 static bool s_touch_down, s_shift, s_shift_left, s_shift_right, s_fn, s_sym;
@@ -1040,6 +1045,9 @@ enum {
     ACT_INSTRUMENT = 10,
     ACT_CLOCK,
     ACT_BACK,
+    ACT_CALCULATOR,
+    ACT_CALENDAR,
+    ACT_GAME,
     ACT_TIMBRE = 20,
     ACT_OCT_DOWN = 25,
     ACT_OCT_UP,
@@ -1065,6 +1073,20 @@ enum {
     ACT_SERVER,
     ACT_TZ_DOWN,
     ACT_TZ_UP,
+    ACT_CALC_CLEAR = 500,
+    ACT_CALC_DELETE,
+    ACT_CALC_EQUALS,
+    ACT_CALC_CHAR = 520, /* ASCII character offset; ends at 647 */
+    ACT_CAL_PREV = 650,
+    ACT_CAL_NEXT,
+    ACT_CAL_YEAR_PREV,
+    ACT_CAL_YEAR_NEXT,
+    ACT_CAL_TODAY,
+    ACT_GAME_MOVE = 660,
+    ACT_GAME_RESTART = 670,
+    ACT_GAME_CONFIRM,
+    ACT_GAME_CANCEL,
+    ACT_GAME_CONTINUE,
     ACT_RGB_DOWN = 300,
     ACT_RGB_UP = 310,
     ACT_EDIT_CHAR = 1000,
@@ -1616,34 +1638,136 @@ static void draw_piano(const instrument_snapshot_t *st) {
                  held ? p->tab_sel_fg : C_WHITE, black[i]);
     }
 }
+static bool app_today(calendar_date_t *date) {
+    net_snapshot_t net;
+    net_service_get_snapshot(&net);
+    return calendar_today(time(NULL), net.timezone_offset_minutes, net.time_valid, date);
+}
+static void draw_calculator(void) {
+    const theme_pal_t *p = pal();
+    fb_round_card(40, 188, 944, 136, 9, 1, p->frame, p->card2);
+    char line[33];
+    snprintf(line, sizeof(line), "%.32s", s_calculator.input);
+    draw_txt(60, 201, 24, p->text2, line[0] ? line : "0");
+    if (strlen(s_calculator.input) > 32)
+        draw_txt(60, 233, 24, p->text2, s_calculator.input + 32);
+    const char *result = s_calculator.result;
+    if (s_calculator.error == CALC_SYNTAX) result = tr("Invalid expression", "表达式错误");
+    if (s_calculator.error == CALC_DIV_ZERO) result = tr("Cannot divide by zero", "不能除以零");
+    if (s_calculator.error == CALC_RANGE) result = tr("Result or nesting out of range", "结果或括号超出范围");
+    if (s_calculator.error == CALC_TOO_LONG) result = tr("Input limit: 63 characters", "最多输入 63 个字符");
+    draw_txt_fit(60, 273, 30, 904, s_calculator.error ? p->warn : p->text, result);
+    static const char *labels[] = {"7","8","9","/","C", "4","5","6","*","DEL",
+                                    "1","2","3","-","(", "0",".","=","+",")"};
+    for (int i = 0; i < 20; i++) {
+        int id = i == 4 ? ACT_CALC_CLEAR : i == 9 ? ACT_CALC_DELETE :
+                 i == 17 ? ACT_CALC_EQUALS : ACT_CALC_CHAR + labels[i][0];
+        button(id, 40 + (i % 5) * 191, 343 + (i / 5) * 80, 180, 68, labels[i], i == 17, true);
+    }
+    draw_txt(44, 690, 20, p->text2,
+             tr("Type numbers / Shift / Sym · Enter = · Backspace · C clear", "数字 / Shift / Sym 输入 · 回车计算 · 退格 · C 清空"));
+}
+static void draw_calendar(void) {
+    const theme_pal_t *p = pal();
+    calendar_date_t today;
+    bool valid = app_today(&today);
+    char b[96];
+    snprintf(b, sizeof(b), "%04d / %02d", s_calendar.year, s_calendar.month);
+    draw_txt_centered(191, 38, p->text, b);
+    button(ACT_CAL_YEAR_PREV, 44, 189, 100, 56, "<<", false, s_calendar.year > 1);
+    button(ACT_CAL_PREV, 154, 189, 100, 56, "<", false, s_calendar.year > 1 || s_calendar.month > 1);
+    button(ACT_CAL_NEXT, 770, 189, 100, 56, ">", false, s_calendar.year < 9999 || s_calendar.month < 12);
+    button(ACT_CAL_YEAR_NEXT, 880, 189, 100, 56, ">>", false, s_calendar.year < 9999);
+    static const char *days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    for (int i = 0; i < 7; i++)
+        draw_txt(70 + i * 135, 266, 22, p->text2, days[i]);
+    int first = calendar_weekday(s_calendar.year, s_calendar.month, 1);
+    int count = calendar_days(s_calendar.year, s_calendar.month);
+    for (int i = 0; i < 42; i++) {
+        int day = i - first + 1, x = 44 + (i % 7) * 135, y = 307 + (i / 7) * 53;
+        bool marked = valid && today.year == s_calendar.year && today.month == s_calendar.month && day == today.day;
+        if (day < 1 || day > count) continue;
+        fb_round_card(x, y, 126, 45, 7, 1, marked ? p->accent2 : p->frame, marked ? p->accent : p->card2);
+        snprintf(b, sizeof(b), "%d", day);
+        draw_txt(x + (126 - txt_w(24, b)) / 2, y + 8, 24, marked ? p->tab_sel_fg : p->text, b);
+    }
+    button(ACT_CAL_TODAY, 44, 646, 180, 60, tr("Today (T)", "今天 (T)"), false, valid);
+    if (valid) {
+        snprintf(b, sizeof(b), "%s %04d-%02d-%02d", tr("Today", "今天"), today.year, today.month, today.day);
+        draw_txt(248, 644, 23, p->text2, b);
+    } else draw_txt(248, 644, 23, p->warn, tr("Time has not been synchronized", "时间尚未同步"));
+    draw_txt(248, 686, 20, p->text2, tr("Left/Right: month · Up/Down: year", "左右翻月 · 上下翻年"));
+}
+static void draw_game(void) {
+    const theme_pal_t *p = pal();
+    char b[64];
+    for (int i = 0; i < 16; i++) {
+        int x = 48 + (i % 4) * 119, y = 197 + (i / 4) * 119;
+        uint8_t power = s_game.cells[i];
+        uint16_t fill = power ? (power >= 11 ? p->accent : p->card2) : p->bg;
+        fb_round_card(x, y, 108, 108, 9, 2, power ? p->accent2 : p->frame, fill);
+        if (power) {
+            snprintf(b, sizeof(b), "%lu", (unsigned long)(UINT32_C(1) << power));
+            int size = 38;
+            while (size > 14 && txt_w(size, b) > 96) size -= 2;
+            draw_txt(x + (108 - txt_w(size, b)) / 2, y + (108 - size) / 2, size,
+                     power >= 11 ? p->tab_sel_fg : p->text, b);
+        }
+    }
+    snprintf(b, sizeof(b), "%s  %lu", tr("Score", "得分"), (unsigned long)s_game.score);
+    draw_txt(554, 198, 32, p->text, b);
+    const char *status = s_game.over ? tr("Game over", "游戏结束") :
+        s_game.won && !s_game.continued ? tr("2048! You win", "2048！你赢了") :
+        s_game.won ? tr("Keep going", "继续挑战") : tr("Join tiles to reach 2048", "合并数字，达到 2048");
+    draw_txt(554, 259, 26, s_game.over ? p->warn : p->accent2, status);
+    if (s_game_restart) {
+        draw_txt(554, 345, 26, p->text, tr("Start a new game?", "开始新游戏？"));
+        button(ACT_GAME_CONFIRM, 554, 416, 198, 68, tr("Restart", "重新开始"), true, true);
+        button(ACT_GAME_CANCEL, 768, 416, 196, 68, tr("Cancel", "取消"), false, true);
+    } else {
+        bool enabled = !s_game.over && (!s_game.won || s_game.continued);
+        button(ACT_GAME_MOVE + GAME_UP, 697, 330, 120, 72, tr("Up", "上"), false, enabled);
+        button(ACT_GAME_MOVE + GAME_LEFT, 563, 416, 120, 72, tr("Left", "左"), false, enabled);
+        button(ACT_GAME_MOVE + GAME_DOWN, 697, 416, 120, 72, tr("Down", "下"), false, enabled);
+        button(ACT_GAME_MOVE + GAME_RIGHT, 831, 416, 120, 72, tr("Right", "右"), false, enabled);
+        if (s_game.won && !s_game.continued && !s_game.over)
+            button(ACT_GAME_CONTINUE, 563, 516, 388, 64, tr("Continue", "继续"), true, true);
+        button(ACT_GAME_RESTART, 563, 600, 388, 64, tr("New game (R)", "新游戏 (R)"), false, true);
+    }
+    draw_txt(48, 699, 21, p->text2, tr("Arrow keys / WASD or touch arrows · Fn+Tab: back", "方向键 / WASD 或触摸方向按钮 · Fn+Tab 返回"));
+}
 static void draw_apps(void) {
     const theme_pal_t *p = pal();
     char b[100];
     if (!s_app) {
         section(111, tr("Apps", "应用"));
-        const char *labels[] = {tr("MIDI instrument", "MIDI 小乐器"), tr("Clock", "时钟")};
-        for (int i = 0; i < 2; i++) {
-            int x = 20 + i * 498;
-            button(i ? ACT_CLOCK : ACT_INSTRUMENT, x, 160, 486, 365, "", false, true);
-            fb_fill_round_rect(x + 181, 206, 124, 124, 24, p->card2);
-            draw_icon(i ? ICON_CLOCK : ICON_KEYBOARD, x + 206, 231, 74, p->accent2);
-            draw_txt(x + (486 - txt_w(30, labels[i])) / 2, 364, 30, p->text, labels[i]);
-            const char *sub =
-                i ? tr("Network time (NTP)", "网络时间（NTP）") : tr("Local audio", "本地音源");
-            draw_txt(x + (486 - txt_w(20, sub)) / 2, 424, 20, p->text2, sub);
+        const char *labels[] = {tr("MIDI instrument", "MIDI 小乐器"), tr("Clock", "时钟"),
+                                tr("Calculator", "计算器"), tr("Calendar", "日历"), "2048"};
+        const int ids[] = {ACT_INSTRUMENT, ACT_CLOCK, ACT_CALCULATOR, ACT_CALENDAR, ACT_GAME};
+        const icon_t icons[] = {ICON_KEYBOARD, ICON_CLOCK, ICON_APPS, ICON_CHART, ICON_LAYERS};
+        for (int i = 0; i < 5; i++) {
+            int x = 20 + (i % 3) * 332, y = 157 + (i / 3) * 233;
+            button(ids[i], x, y, 320, 216, "", false, true);
+            fb_fill_round_rect(x + 124, y + 25, 72, 72, 16, p->card2);
+            draw_icon(icons[i], x + 140, y + 41, 40, p->accent2);
+            draw_txt(x + (320 - txt_w(28, labels[i])) / 2, y + 124, 28, p->text, labels[i]);
+            const char *sub = i == 1 ? tr("Network time (NTP)", "网络时间（NTP）") :
+                i == 3 ? tr("Month view", "月历") : tr("Runs locally", "本地运行");
+            draw_txt(x + (320 - txt_w(20, sub)) / 2, y + 171, 20, p->text2, sub);
         }
-        fb_round_card(20, 549, 984, 172, 9, 1, p->frame, p->card);
-        draw_icon(ICON_SENSOR, 45, 577, 38, p->accent2);
-        draw_txt(102, 584, 24, p->text, tr("Runs locally on ESP32-S3", "在 ESP32-S3 上独立运行"));
-        draw_txt(
-            45, 649, 21, p->text2,
-            tr("Tab: select · Enter: open · Fn+Tab: back", "Tab 选择 · 回车打开 · Fn+Tab 返回"));
+        draw_txt(44, 643, 24, p->text, tr("Runs locally on ESP32-S3", "在 ESP32-S3 上独立运行"));
+        draw_txt(44, 690, 21, p->text2,
+                 tr("Tab: select · Enter: open · Fn+Tab: back", "Tab 选择 · 回车打开 · Fn+Tab 返回"));
         return;
     }
     fb_round_card(20, 98, 984, 651, 9, 1, p->frame, p->card);
     icon_button(ACT_BACK, 40, 116, 134, 52, ICON_BACK, tr("Back", "返回"), false, true);
-    draw_txt(196, 125, 32, p->text,
-             s_app == 2 ? tr("Clock", "时钟") : tr("MIDI instrument", "MIDI 小乐器"));
+    const char *title = s_app == 2 ? tr("Clock", "时钟") : s_app == 3 ? tr("Calculator", "计算器") :
+                        s_app == 4 ? tr("Calendar", "日历") : s_app == 5 ? "2048" : tr("MIDI instrument", "MIDI 小乐器");
+    draw_txt(196, 125, 32, p->text, title);
+    if (s_app == 3) { draw_calculator(); return; }
+    if (s_app == 4) { draw_calendar(); return; }
+    if (s_app == 5) { draw_game(); return; }
     if (s_app == 2) {
         net_snapshot_t net;
         net_service_get_snapshot(&net);
@@ -2042,6 +2166,14 @@ static void activate(int id) {
         pi_share_request(s_pi_page==1 ? SHARE_LIST : SHARE_SCREEN,NULL); return;
     }
     if (id == 435) { pi_share_forget(); return; }
+    if (id >= ACT_CALC_CHAR && id < ACT_CALC_CHAR + 128) {
+        calculator_input(&s_calculator, (char)(id - ACT_CALC_CHAR));
+        return;
+    }
+    if (id >= ACT_GAME_MOVE && id <= ACT_GAME_MOVE + GAME_DOWN) {
+        if (!s_game_restart) game2048_move(&s_game, (game_direction_t)(id - ACT_GAME_MOVE));
+        return;
+    }
     switch (id) {
     case ACT_CUSTOM:
         memcpy(s_color_draft, s_custom_rgb, sizeof(s_color_draft));
@@ -2070,6 +2202,35 @@ static void activate(int id) {
         s_confirm_shutdown = false;
         queued = pi_link_request_shutdown();
         break;
+    case ACT_CALCULATOR:
+        s_app = 3; s_focus = -1;
+        break;
+    case ACT_CALENDAR:
+        s_app = 4; s_focus = -1;
+        if (!s_calendar.year && !app_today(&s_calendar)) s_calendar = (calendar_date_t){2000, 1, 1};
+        break;
+    case ACT_GAME:
+        s_app = 5; s_focus = -1; s_game_restart = false;
+        if (!s_game_started) {
+            game2048_start(&s_game, (uint32_t)esp_timer_get_time());
+            s_game_started = true;
+        }
+        break;
+    case ACT_CALC_CLEAR: calculator_clear(&s_calculator); break;
+    case ACT_CALC_DELETE: calculator_backspace(&s_calculator); break;
+    case ACT_CALC_EQUALS: calculator_equals(&s_calculator); break;
+    case ACT_CAL_PREV: calendar_shift(&s_calendar, -1); break;
+    case ACT_CAL_NEXT: calendar_shift(&s_calendar, 1); break;
+    case ACT_CAL_YEAR_PREV: calendar_shift(&s_calendar, -12); break;
+    case ACT_CAL_YEAR_NEXT: calendar_shift(&s_calendar, 12); break;
+    case ACT_CAL_TODAY: app_today(&s_calendar); break;
+    case ACT_GAME_RESTART: s_game_restart = true; s_focus = -1; break;
+    case ACT_GAME_CONFIRM:
+        game2048_start(&s_game, (uint32_t)esp_timer_get_time());
+        s_game_restart = false; s_focus = -1;
+        break;
+    case ACT_GAME_CANCEL: s_game_restart = false; s_focus = -1; break;
+    case ACT_GAME_CONTINUE: game2048_continue(&s_game); s_focus = -1; break;
     case ACT_INSTRUMENT:
         s_app = 1;
         clear_notes();
@@ -2342,6 +2503,37 @@ void ui_key_event(int row, int col, bool pressed) {
     if (xQueueSend(s_keys, &e, 0) != pdTRUE)
         s_key_overflow = true;
 }
+static char typed_character(int r, int c) {
+    char ch = 0;
+    if (r == 1 && c < 10)
+        ch = "1234567890"[c];
+    if (r == 2 && c > 0)
+        ch = "qwertyuiop"[c - 1];
+    if (r == 3 && c > 0 && c < 10)
+        ch = "asdfghjkl"[c - 1];
+    if (r == 4 && c > 0 && c < 9)
+        ch = "zxcvbnm;"[c - 1];
+    if (r == 5 && c >= 3 && c <= 7)
+        ch = ' ';
+    if (ch) {
+        if (s_sym) {
+            if (r == 2 && c >= 1 && c <= 8)
+                ch = "/?`~-_=+"[c - 1];
+            if (r == 3 && c >= 2 && c <= 9)
+                ch = ",.\\|[]{}"[c - 2];
+            if (r == 4 && c >= 4 && c <= 8)
+                ch = "<>'\":"[c - 4];
+        } else if (s_shift) {
+            if (ch >= 'a' && ch <= 'z')
+                ch -= 'a' - 'A';
+            else if (r == 1 && c < 10)
+                ch = "!@#$%^&*()"[c];
+            else if (ch == ';')
+                ch = ':';
+        }
+    }
+    return ch;
+}
 void ui_process_events(void) {
     if (!s_keys) {
         s_keys = xQueueCreate(64, sizeof(key_event_t));
@@ -2381,33 +2573,8 @@ void ui_process_events(void) {
             continue;
         }
         if (s_editor) {
-            char ch = 0;
-            if (r == 1 && c < 10)
-                ch = "1234567890"[c];
-            if (r == 2 && c > 0)
-                ch = "qwertyuiop"[c - 1];
-            if (r == 3 && c > 0 && c < 10)
-                ch = "asdfghjkl"[c - 1];
-            if (r == 4 && c > 0 && c < 9)
-                ch = "zxcvbnm;"[c - 1];
-            if (r == 5 && c >= 3 && c <= 7)
-                ch = ' ';
+            char ch = typed_character(r, c);
             if (ch) {
-                if (s_sym) {
-                    if (r == 2 && c >= 1 && c <= 8)
-                        ch = "/?`~-_=+"[c - 1];
-                    if (r == 3 && c >= 2 && c <= 9)
-                        ch = ",.\\|[]{}"[c - 2];
-                    if (r == 4 && c >= 4 && c <= 8)
-                        ch = "<>'\":"[c - 4];
-                } else if (s_shift) {
-                    if (ch >= 'a' && ch <= 'z')
-                        ch -= 'a' - 'A';
-                    else if (r == 1 && c < 10)
-                        ch = "!@#$%^&*()"[c];
-                    else if (ch == ';')
-                        ch = ':';
-                }
                 editor_add(ch);
             } else if (r == 1 && c == 10)
                 activate(ACT_EDIT_BACK);
@@ -2431,6 +2598,32 @@ void ui_process_events(void) {
                 change_tab(UI_TAB_APPS);
             dirty = true;
             continue;
+        }
+        if (s_tab == UI_TAB_APPS && s_app >= 3) {
+            int action = -1;
+            if (s_app == 3) {
+                char ch = typed_character(r, c);
+                if (ch && strchr("0123456789.+-*/()", ch)) action = ACT_CALC_CHAR + ch;
+                else if (r == 1 && c == 10) action = ACT_CALC_DELETE;
+                else if (ch == 'c' || ch == 'C') action = ACT_CALC_CLEAR;
+                else if ((r == 3 && c == 10 && s_focus < 0) || ch == '=') action = ACT_CALC_EQUALS;
+            } else if (s_app == 4) {
+                if (r == 5 && c == 8) action = ACT_CAL_PREV;
+                if (r == 5 && c == 10) action = ACT_CAL_NEXT;
+                if (r == 4 && c == 9) action = ACT_CAL_YEAR_PREV;
+                if (r == 5 && c == 9) action = ACT_CAL_YEAR_NEXT;
+                if (r == 2 && c == 5) action = ACT_CAL_TODAY;
+            } else {
+                if ((r == 5 && c == 8) || (r == 3 && c == 1)) action = ACT_GAME_MOVE + GAME_LEFT;
+                if ((r == 5 && c == 10) || (r == 3 && c == 3)) action = ACT_GAME_MOVE + GAME_RIGHT;
+                if ((r == 4 && c == 9) || (r == 2 && c == 2)) action = ACT_GAME_MOVE + GAME_UP;
+                if ((r == 5 && c == 9) || (r == 3 && c == 2)) action = ACT_GAME_MOVE + GAME_DOWN;
+                if (r == 2 && c == 4) action = ACT_GAME_RESTART;
+                if (r == 3 && c == 10 && s_focus < 0 && s_game.won && !s_game_restart) action = ACT_GAME_CONTINUE;
+            }
+            if (action >= 0) {
+                activate(action); s_focus = -1; dirty = true; continue;
+            }
         }
         if (s_tab == UI_TAB_APPS && s_app == 1) {
             instrument_snapshot_t st;

@@ -17,6 +17,7 @@ run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_co
 run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_share.py'])
 with tempfile.TemporaryDirectory(prefix='typix-check-') as work:
     for name, sources, flags in [
+        ('builtin-apps', ['main/builtin_apps.c', 'tests/test_builtin_apps.c'], []),
         ('instrument', ['main/instrument_engine.c', 'tests/test_instrument_engine.c'], []),
         ('pi-link', ['main/pi_link.c', 'tests/test_pi_link.c'], ['-DPI_LINK_HOST_TEST']),
     ]:

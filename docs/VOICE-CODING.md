@@ -4,15 +4,16 @@
 
 ## 目前可以改什么
 
-0.4.2 的应用仍编译进 ESP32 固件。可以在 CM4 上改时钟排版、MIDI 界面/键盘映射、合成器算法并运行宿主测试；**没有独立下载、热加载插件的运行时**。动态轻应用的权限、资源预算与存储方案仍见 [规划](hmi-and-apps.md#动态应用是否可靠)。本次开发环境没有新增插件加载能力。
+0.4.3 候选的应用仍编译进 ESP32 固件。可以在 CM4 上改时钟排版、MIDI 界面/键盘映射、合成器算法并运行宿主测试；**没有独立下载、热加载插件的运行时**。动态轻应用的权限、资源预算与存储方案仍见 [规划](hmi-and-apps.md#动态应用是否可靠)。本次开发环境没有新增插件加载能力。
 
 | 修改内容 | 源码入口 |
 | --- | --- |
-| 应用列表、时钟、MIDI 布局 | `main/ui.c` 的 `draw_apps()`，其中 `s_app == 2` 是时钟 |
+| 应用列表、时钟、MIDI、计算器、日历、2048 布局 | `main/ui.c` 的 `draw_apps()`，其中 `s_app == 2` 是时钟 |
 | 钢琴绘图与点击区 | `main/ui.c` 的 `draw_piano()` 与琴键命中逻辑 |
 | 音色、复音、音符包络 | `main/instrument_engine.c` / `.h` |
 | 硬件音频与输入整合 | `main/instrument.c`；改这里需要额外真机验证 |
 | 界面演示状态与交互断言 | `tools/preview_ui.c` |
+| 计算器、公历、2048 的纯逻辑与测试 | `main/builtin_apps.c` / `.h`、`tests/test_builtin_apps.c` |
 | 合成器测试 | `tests/test_instrument_engine.c` |
 
 先体验低风险的时钟界面。可以对 ChatGPT 说：
@@ -28,7 +29,7 @@ cd /home/pi/Workspace/typixdeck/firmware/diy-esp32s3-firmware
 TYPIX_HOST_SANITIZERS=undefined python3 tools/preview_apps.py
 ```
 
-窗口用实际 C framebuffer 绘图代码生成时钟、MIDI、应用列表的图片。修改后按 F5 重新编译渲染，Esc 退出。图像使用演示数据，不能直接点击图片弹琴，不会读取或刷写 ESP32。编译失败会隐藏旧图并在终端显示错误。
+窗口用实际 C framebuffer 绘图代码生成时钟、MIDI、计算器、日历、2048、应用列表及错误/胜负状态的图片。修改后按 F5 重新编译渲染，Esc 退出。图像使用演示数据，不能直接点击图片弹琴，不会读取或刷写 ESP32。编译失败会隐藏旧图并在终端显示错误。
 
 ```sh
 # 终端或 SSH 下仅生成图片，无需图形会话

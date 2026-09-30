@@ -4,6 +4,20 @@
 
 [下载 0.4.2](https://github.com/typixdeck/diy-esp32s3-firmware/releases/tag/v0.4.2) · [发布说明与验收范围](docs/releases/0.4.2.md)
 
+## 0.4.3 本地候选：内置应用
+
+当前源码版本为 **0.4.3 候选**，新增计算器、日历、2048，与 MIDI、时钟同在“应用”页，通过触摸或实体键盘操作。固定内存、离线运行，未增加动态插件、后台任务或网络请求；未改变板级配置、驱动、分区或 NVS。候选尚未发布或刷入真机，`hardware_verified=false`。
+
+- 计算器：四则运算、括号、小数、负数、运算优先级，除零/输入/范围错误提示；最多 63 个字符、16 层嵌套。Enter 计算、Backspace 退格、C 清空，符号沿用 Shift/Sym。
+- 日历：公历 1–9999 年，左右翻月、上下翻年、T 回到今天。使用时间设置中的 UTC 偏移；未对时时显示提示且不标记今天，首次从 2000 年 1 月开始浏览。
+- 2048：触摸方向按钮、方向键或 WASD 移动，R 打开新局确认；首次达到 2048 暂停，可继续；无路可走显示结束。返回应用列表保留本轮状态，重启设备不保留。
+
+说明、按键表和验收边界见 [内置应用](docs/builtin-apps.md) · [0.4.3 候选记录](docs/releases/0.4.3.md)。以下为真实 C 绘图代码使用演示数据生成的图片，不是真机截图：
+
+![计算器演示](docs/screenshots/calculator-dark.png)
+![日历演示](docs/screenshots/calendar-dark.png)
+![2048 演示](docs/screenshots/2048-dark.png)
+
 ## 0.4.2 电量计修正
 
 - 补齐 STC3117 冷启动初始化，并修复旧 DIY 从 0% 起算的已知配置；电压/SOC 曲线分别完整写入正确寄存器。
@@ -63,7 +77,7 @@
 | --- | --- |
 | 固件 | 连接拓扑、组件读数、接口详情、四种历史曲线、RAM/PSRAM 状态 |
 | 树莓派 | 在线状态、IP、CPU、可用内存/存储、运行时间、配对只读文件/截图、串口协作关机 |
-| 应用 | MIDI 小乐器、时钟，运行在 ESP32 上 |
+| 应用 | MIDI 小乐器、时钟、计算器、日历、2048，运行在 ESP32 上 |
 | 设置 | Wi-Fi 扫描/连接/忘记网络、NTP 服务器/立即对时/时区、语言、八色主题色盘、自定义 RGB 颜色、亮/暗背景 |
 
 旧的四套 Theme 已移除。外观偏好保存在 NVS；旧 `theme` 键忽略，语言与预设色编号保留。保存失败在界面提示，不自动擦除 NVS。字体子集缺少翻译字形时回退到可显示的简体或英文，避免空白方框。
@@ -119,7 +133,7 @@ NTP 默认 `pool.ntp.org`，可修改。时区为 UTC 偏移，支持半小时�
 
 ## 构建与本地验证
 
-在 CM4 上用 ChatGPT 修改内置时钟/MIDI、预览界面并通过 GitHub 同步，见 [语音编程指南](docs/VOICE-CODING.md)。运行 `python3 tools/preview_apps.py` 可查看当前源码生成的应用图片；无需连接 ESP32。当前内置应用还不是可热加载插件。
+在 CM4 上用 ChatGPT 修改内置应用、预览界面并通过 GitHub 同步，见 [语音编程指南](docs/VOICE-CODING.md)。运行 `python3 tools/preview_apps.py` 可查看当前源码生成的应用图片；无需连接 ESP32。当前内置应用还不是可热加载插件。
 
 目标 `esp32s3`，8 MB Flash + 8 MB PSRAM；当前编译验证使用 **ESP-IDF 5.5.1**，依赖记录在 `dependencies.lock`。先激活对应 ESP-IDF 环境，再运行：
 
@@ -132,8 +146,8 @@ python tools/package.py
 
 产物在 `build/package/`：
 
-- `typixdeck-diy-0.4.2-app.bin`：应用镜像，仅在分区、字体布局兼容时适用。
-- `typixdeck-diy-0.4.2-full.bin`：Bootloader、分区表、应用、字体；完整写入会覆盖 NVS。
+- `typixdeck-diy-0.4.3-app.bin`：应用镜像，仅在分区、字体布局兼容时适用。
+- `typixdeck-diy-0.4.3-full.bin`：Bootloader、分区表、应用、字体；完整写入会覆盖 NVS。
 - `manifest.json`：地址、大小、SHA256、未完成硬件验收标识。
 
 主机行为测试需 C 编译器、Python 3、pkg-config 和 FreeType：
@@ -142,7 +156,7 @@ python tools/package.py
 python3 tools/check.py
 ```
 
-覆盖音频初始化 13 个失败点的资源回收、RTC 暖复位/损坏记录/输出边界、Wi-Fi 延迟初始化与初始化失败、网络失败/取消/存储失败、合成器音高/复音/释放、Pi 协议会话/重放/超时、主机授权，以及实际 UI/TTF 绘图的按钮边界、黑白琴键命中和持有、自定义颜色应用/取消/保存、输入、音符释放和密码遮蔽。C 检查启用 ASan/UBSan。
+覆盖计算器有界解析/错误/编辑、公历 400 年周期与时区、2048 合并/生成/胜负/继续/重开、新应用触摸与实体键盘入口，以及音频初始化 13 个失败点的资源回收、RTC 暖复位/损坏记录/输出边界、Wi-Fi 延迟初始化与初始化失败、网络失败/取消/存储失败、合成器音高/复音/释放、Pi 协议会话/重放/超时、主机授权，以及实际 UI/TTF 绘图的按钮边界、黑白琴键命中和持有、自定义颜色应用/取消/保存、输入、音符释放和密码遮蔽。C 检查启用 ASan/UBSan。
 
 仅生成预览：`python3 tools/preview_ui.py`，输出 `build/preview-ui/`。测试数据只在 `tools/`、`tests/` 中，不参与设备固件编译。
 

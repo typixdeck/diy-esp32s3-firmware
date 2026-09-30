@@ -69,7 +69,12 @@ def main():
     box.pack_start(bar, False, False, 0)
     selector = Gtk.ComboBoxText()
     pages = [("时钟", "clock-dark.png"), ("MIDI 小乐器", "instrument-dark.png"),
-             ("按住琴键", "instrument-held-dark.png"), ("应用列表", "apps-dark.png")]
+             ("按住琴键", "instrument-held-dark.png"), ("应用列表", "apps-dark.png"),
+             ("计算器", "calculator-dark.png"), ("计算器：亮色", "calculator-light.png"),
+             ("计算器：错误", "calculator-error-dark.png"), ("日历", "calendar-dark.png"),
+             ("日历：亮色", "calendar-light.png"), ("日历：未对时", "calendar-unsynced-dark.png"),
+             ("2048", "2048-dark.png"), ("2048：亮色", "2048-light.png"),
+             ("2048：获胜", "2048-win-dark.png"), ("2048：结束", "2048-over-dark.png")]
     for title, _name in pages:
         selector.append_text(title)
     selector.set_active(0)

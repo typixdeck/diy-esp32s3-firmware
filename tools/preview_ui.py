@@ -33,7 +33,7 @@ with tempfile.TemporaryDirectory(prefix='typix-ui-preview-') as work:
                     '-Wno-unused-variable', '-Wno-missing-field-initializers', '-Wno-sign-compare', '-Wno-misleading-indentation',
                     *sanitizer_flags(), '-fno-omit-frame-pointer',
                     '-I', str(work), '-I', str(root/'tools'),
-                    str(root/'tools/preview_ui.c'), str(root/'main/ttf_font.c'),
+                    str(root/'tools/preview_ui.c'), str(root/'main/ttf_font.c'), str(root/'main/builtin_apps.c'),
                     *freetype, '-lm', '-o', str(binary)], check=True)
     subprocess.run([str(binary), str(root/'fonts/puhui_subset.ttf'), str(args.output.resolve())], check=True)
 for path in args.output.glob('*.ppm'):
@@ -56,7 +56,7 @@ for path in args.output.glob('*.ppm'):
                                   (root/'CMakeLists.txt').read_text()).group(1),
     'fixtures': 'Synthetic sensor, network, clock, audio and Raspberry Pi state. No hardware or network access.',
     'renderers': {name: hashlib.sha256((root/name).read_bytes()).hexdigest()
-                  for name in ('main/ui.c', 'main/ttf_font.c')},
+                  for name in ('main/ui.c', 'main/ttf_font.c', 'main/builtin_apps.c', 'main/builtin_apps.h')},
     'images': sorted(p.name for p in args.output.glob('*.png')),
 }, indent=2) + '\n')
 print(args.output.resolve())
