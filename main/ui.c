@@ -1246,8 +1246,6 @@ static void dash_read(dash_data_t *d) {
     d->vbus_ok = s_ctx.ina_vbus && ina219_read(s_ctx.ina_vbus, &d->vbus_v, &d->vbus_a) == ESP_OK;
     if (!s_ctx.cw2015 || cw2015_read(s_ctx.cw2015, &d->cw_v, &d->cw_soc) != ESP_OK)
         d->cw_soc = -1;
-    if (s_mux_esp)
-        stc3117_ensure_running(s_ctx.stc3117);
     if (!s_mux_esp || !s_ctx.stc3117 ||
         stc3117_read(s_ctx.stc3117, &d->stc_v, &d->stc_soc) != ESP_OK)
         d->stc_soc = -1;
@@ -1255,7 +1253,7 @@ static void dash_read(dash_data_t *d) {
         s_mux_esp && s_ctx.stc3117 && stc3117_read_current(s_ctx.stc3117, &d->stc_a) == ESP_OK;
     // 主 SOC 只用 STC3117（带采样电阻库仑计，2026-09-11 起不再回退 CW2015：
     // 切屏瞬间 STC 还在 MUX 另一侧，回退会闪一下 CW2015 的另一个百分比）。
-    // 读不到显示 "--"，main 在 MUX 切换后 ~100ms 会补一次重绘。CW2015 只在脚注小字。
+    // 新鲜有效样本到来前显示 "--"；切屏后至少两个采样确认转换计数前进。
     d->soc = d->stc_soc >= 0 ? (int)(d->stc_soc + 0.5f) : -1;
     d->plugged = d->vbus_ok && d->vbus_v > 4.0f;
     d->soc_col = d->soc < 0 ? p->dim : d->soc < 15 ? p->bad : d->soc < 40 ? p->warn : p->good;

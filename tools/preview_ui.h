@@ -161,7 +161,7 @@ static inline const char *esp_err_to_name(esp_err_t err) {
     return "HOST_FIXTURE";
 }
 static inline const esp_app_desc_t *esp_app_get_description(void) {
-    static const esp_app_desc_t d = {"0.4.1-preview", "2026-09-30"};
+    static const esp_app_desc_t d = {"0.4.2-preview", "2026-09-30"};
     return &d;
 }
 static inline esp_err_t esp_lcd_panel_draw_bitmap(esp_lcd_panel_handle_t h, int x0, int y0, int x1,

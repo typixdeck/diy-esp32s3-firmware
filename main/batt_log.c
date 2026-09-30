@@ -150,7 +150,7 @@ static void batt_log_task(void *arg)
         // 主 SOC：STC3117（走 MUX，Pi 持屏时读失败是常态，静默回退）
         float stc_v = 0, stc_soc = -1;
         if (s_stc) {
-            stc3117_ensure_running(s_stc);   // POR/BATFAIL 兜底，MUX 不通时无害
+            stc3117_poll(s_stc, s_cw, s.bus_mv > 4000); // 唯一电量计写入者
             if (stc3117_read(s_stc, &stc_v, &stc_soc) != ESP_OK) stc_soc = -1;
         }
         if (stc_soc >= 0) {

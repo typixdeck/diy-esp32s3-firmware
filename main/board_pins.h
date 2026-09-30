@@ -64,7 +64,9 @@
 // 这里只是**默认种子**：batt_log 的库仑计数自学习会在放电中估出真实容量并
 // 存 NVS（"batt"/"cap_mah"），之后以学习值为准（见 batt_log.c）。
 // STC3117 的容量是要写进 CC_CNF 的输入参数，不是测量结果。
-#define BOARD_BATT_CAPACITY_MAH  3000
+#define BOARD_BATT_CAPACITY_MAH  2400
+// 原装 604070 4.2 V 电芯参考配置，非本机内阻实测；接管时保留已有 CNF。
+#define BOARD_BATT_RI_MOHM       140
 #define BOARD_BATT_NOMINAL_V     3.7f
 
 // ---- 面板时序（与 Pi 端 DPI overlay 完全一致：1144×803 总幅面）----

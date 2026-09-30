@@ -56,68 +56,77 @@ esp_err_t cw2015_wake(i2c_master_dev_handle_t dev)
     return i2c_master_transmit(dev, wake, 2, 100);
 }
 
-// ---------------------------------------------------------------------------
-// STC3117：V LSB 2.20mV，SOC LSB 1/512%
-// ⚠️ POR 默认 MODE = VMODE=1（纯电压模式）+ GG_RUN=0（standby，读数冻结）。
-// 手册 §6.1.4："Current sensing is available only in mixed mode (VMODE=0)"、
-// "The Coulomb counter is inactive if the VMODE bit is set, this is the default
-// state at POR"。旧固件只置 GG_RUN 没清 VMODE → 电流寄存器恒 ≈0、SOC 只靠 OCV
-// 表且未标定（2026-09-10 实机：放电 1.5A 时 STC 电流读 -2mA、SOC 66%/79% 乱跳）。
-// 正确姿势：先写 CC_CNF/VM_CNF（按 10mΩ + 标称容量），再 MODE=GG_RUN（VMODE=0）。
-// ---------------------------------------------------------------------------
-#include "board_pins.h"
-#define STC3117_REG_MODE   0x00
-#define STC3117_REG_CC_CNF 0x0F   // 16bit LE：Rsense[mΩ]×Cnom[mAh]/49.556
-#define STC3117_REG_VM_CNF 0x11   // 16bit LE：Ri[mΩ]×Cnom[mAh]/977.78（Ri 取 200mΩ）
-#define STC3117_VMODE      (1 << 0)   // 1=纯电压模式（POR 默认），0=混合模式（库仑计）
-#define STC3117_GG_RUN     (1 << 4)   // 1=运行
-#define STC3117_SENSE_MOHM 10
-#define STC3117_BATT_RI_MOHM 200
+// A single background owner samples/initializes the STC3117. UI reads a
+// validated snapshot; a frame redraw must never re-seed the coulomb counter.
+#include "stc_gauge.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h"
+static SemaphoreHandle_t s_gauge_mutex;
+static StaticSemaphore_t s_gauge_mutex_storage;
+static bool s_gauge_owned = true;
+static stc_gauge_t s_gauge;
 
-static esp_err_t stc3117_write16(i2c_master_dev_handle_t dev, uint8_t reg, uint16_t v)
+void sensors_init(void)
 {
-    uint8_t cmd[3] = { reg, (uint8_t)v, (uint8_t)(v >> 8) };
-    return i2c_master_transmit(dev, cmd, 3, 100);
+    s_gauge_mutex = xSemaphoreCreateMutexStatic(&s_gauge_mutex_storage);
+    s_gauge_owned = true;
+    stc_gauge_invalidate(&s_gauge);
 }
 
-void stc3117_ensure_running(i2c_master_dev_handle_t dev)
+bool sensors_mux_begin(void)
 {
-    uint8_t mode = 0;
-    if (!dev || reg8_read(dev, STC3117_REG_MODE, &mode, 1) != ESP_OK) return;
-    if ((mode & STC3117_GG_RUN) && !(mode & STC3117_VMODE)) return;   // 已在混合模式运行
-    uint16_t cc = (uint16_t)(STC3117_SENSE_MOHM * BOARD_BATT_CAPACITY_MAH / 49.556f + 0.5f);
-    uint16_t vm = (uint16_t)(STC3117_BATT_RI_MOHM * BOARD_BATT_CAPACITY_MAH / 977.78f + 0.5f);
-    uint8_t stop[2] = { STC3117_REG_MODE, 0x00 };                     // 先停（VMODE=0,GG_RUN=0）
-    esp_err_t e = i2c_master_transmit(dev, stop, 2, 100);
-    if (e == ESP_OK) e = stc3117_write16(dev, STC3117_REG_CC_CNF, cc);
-    if (e == ESP_OK) e = stc3117_write16(dev, STC3117_REG_VM_CNF, vm);
-    uint8_t run[2] = { STC3117_REG_MODE, STC3117_GG_RUN };            // 混合模式 + 运行
-    if (e == ESP_OK) e = i2c_master_transmit(dev, run, 2, 100);
-    ESP_LOGI(TAG, "STC3117 mode 0x%02X → 混合模式运行, CC_CNF=%u VM_CNF=%u (%s)",
-             mode, cc, vm, esp_err_to_name(e));
+    return s_gauge_mutex && xSemaphoreTake(s_gauge_mutex, pdMS_TO_TICKS(1000)) == pdTRUE;
 }
 
-#define STC3117_SENSE_OHM  0.010f     // U37 10mΩ（BAT_N → GND）
+void sensors_mux_end(bool esp_side)
+{
+    s_gauge_owned = esp_side;
+    stc_gauge_invalidate(&s_gauge);
+    xSemaphoreGive(s_gauge_mutex);
+}
+
+void stc3117_poll(i2c_master_dev_handle_t dev, i2c_master_dev_handle_t cw,
+                  bool usb_present)
+{
+    if (!sensors_mux_begin()) return;
+    if (s_gauge_owned) {
+        float cw_v=0; int cw_soc;
+        uint8_t mode=0xff;
+        int cw_mv=-1;
+        if (cw && reg8_read(cw,0x0a,&mode,1)==ESP_OK && !(mode&0xc0) &&
+            cw2015_read(cw,&cw_v,&cw_soc)==ESP_OK)
+            cw_mv=(int)(cw_v*1000);
+        stc_status_t before=s_gauge.status;
+        stc_gauge_poll(&s_gauge,dev,cw_mv,usb_present,esp_timer_get_time()/1000);
+        if(s_gauge.status!=before)
+            ESP_LOGI(TAG,"STC3117 state=%d (0 wait,1 ready,2 I2C,3 fault,4 stale,5 invalid,6 seeded,7 full)",s_gauge.status);
+    } else stc_gauge_invalidate(&s_gauge);
+    xSemaphoreGive(s_gauge_mutex);
+}
+
+static bool gauge_snapshot_ready(void)
+{
+    int64_t age=esp_timer_get_time()/1000-s_gauge.last_ms;
+    return s_gauge_owned && s_gauge.valid && age>=0 && age<=7500;
+}
 
 esp_err_t stc3117_read_current(i2c_master_dev_handle_t dev, float *cur_a)
 {
-    uint8_t b[2];
-    ESP_RETURN_ON_ERROR(reg8_read(dev, 0x06, b, 2), TAG, "stc cur");
-    int raw = b[0] | (b[1] << 8);
-    raw &= 0x3FFF;                         // 14bit 二补码
-    if (raw & 0x2000) raw -= 0x4000;
-    *cur_a = (float)raw * 5.88e-6f / STC3117_SENSE_OHM;
-    return ESP_OK;
+    if(!dev || !cur_a || !sensors_mux_begin()) return ESP_ERR_INVALID_STATE;
+    bool ok=gauge_snapshot_ready();
+    if(ok) *cur_a=s_gauge.ma/1000.0f;
+    xSemaphoreGive(s_gauge_mutex);
+    return ok ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
 esp_err_t stc3117_read(i2c_master_dev_handle_t dev, float *v, float *soc)
 {
-    uint8_t b[2];
-    ESP_RETURN_ON_ERROR(reg8_read(dev, 0x08, b, 2), TAG, "stc v");
-    *v = (float)(int16_t)(b[0] | (b[1] << 8)) * 2.20e-3f;
-    ESP_RETURN_ON_ERROR(reg8_read(dev, 0x02, b, 2), TAG, "stc soc");
-    *soc = (float)(uint16_t)(b[0] | (b[1] << 8)) / 512.0f;
-    return ESP_OK;
+    if(!dev || !v || !soc || !sensors_mux_begin()) return ESP_ERR_INVALID_STATE;
+    bool ok=gauge_snapshot_ready();
+    if(ok) { *v=s_gauge.mv/1000.0f; *soc=s_gauge.soc_raw/512.0f; }
+    xSemaphoreGive(s_gauge_mutex);
+    return ok ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
 /* Read the official shared-RAM marker without creating or repairing it.
@@ -133,7 +142,7 @@ static uint8_t sensors_diag_crc8(const uint8_t *data, size_t len)
     return crc;
 }
 
-/* Bounded read-only diagnostics. Never call ensure_running/wake here: those
+/* Bounded read-only diagnostics. Never call poll/wake here: those
  * write the gauges and would destroy evidence of standby/POR/battery-swap.
  * A second request after >= 4 seconds can establish whether counter advances.
  * STC3117 is reachable only while the existing MUX owner is the ESP. */
@@ -144,8 +153,10 @@ size_t sensors_format_diagnostics(i2c_master_dev_handle_t stc, i2c_master_dev_ha
     uint8_t b[19] = {0}, ram[16] = {0}, c = 0;
     float v = 0;
     int soc = -1;
-    int se = stc ? reg8_read(stc, 0, b, sizeof(b)) : ESP_ERR_INVALID_STATE;
+    bool locked=sensors_mux_begin();
+    int se = locked && s_gauge_owned && stc ? reg8_read(stc, 0, b, sizeof(b)) : ESP_ERR_INVALID_STATE;
     int re = se == ESP_OK ? reg8_read(stc, 0x20, ram, sizeof(ram)) : ESP_ERR_INVALID_STATE;
+    if(locked) xSemaphoreGive(s_gauge_mutex);
     int ce = cw ? cw2015_read(cw, &v, &soc) : ESP_ERR_INVALID_STATE;
     int cm = cw ? reg8_read(cw, 0x0a, &c, 1) : ESP_ERR_INVALID_STATE;
     int ram_ok = re == ESP_OK ?

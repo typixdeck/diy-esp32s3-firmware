@@ -81,6 +81,7 @@ static i2c_master_dev_handle_t sensor_add(uint8_t addr)
 
 static void sensors_start(void)
 {
+    sensors_init();
     s_ina_vbat = sensor_add(INA219_VBAT_ADDR);
     s_ina_vbus = sensor_add(INA219_VBUS_ADDR);
     s_cw2015   = sensor_add(0x62);
@@ -88,9 +89,6 @@ static void sensors_start(void)
     if (s_cw2015) {
         cw2015_wake(s_cw2015);
     }
-    // 开机 GT911 复位窗口期间 MUX 在 ESP 侧，顺手启动 STC3117；
-    // 若此刻 MUX 已归还 Pi 侧则静默失败，由遥测页刷新时兜底重试
-    stc3117_ensure_running(s_stc3117);
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +238,7 @@ static volatile bool s_mux_esp_side = true;
 // I2C 瞬时失败（ESD 毛刺）重试 3 次——这条写失败会导致屏幕归属卡死，值得抢救。
 static esp_err_t mux_select(bool esp_side)
 {
+    if (!sensors_mux_begin()) return ESP_ERR_TIMEOUT;
     s_mux_esp_side = esp_side;
     ui_notify_mux(esp_side);
     esp_err_t err = ESP_FAIL;
@@ -247,9 +246,10 @@ static esp_err_t mux_select(bool esp_side)
         err = aw9523_update_bits(s_aw9523, AW9523_REG_OUTPUT_P0,
                                  AW9523_P0_MUX_SEL,
                                  esp_side ? AW9523_P0_MUX_SEL : 0);
-        if (err == ESP_OK) return ESP_OK;
+        if (err == ESP_OK) { sensors_mux_end(esp_side); return ESP_OK; }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
+    sensors_mux_end(false); // unknown ownership: no gauge writes
     ESP_LOGE(TAG, "MUX 写入失败（重试 3 次）：%s，等健康检查自愈", esp_err_to_name(err));
     return err;
 }
@@ -915,7 +915,10 @@ static void aw9523_health_tick(void)
         if (++fail_streak >= 3) {
             fail_streak = 0;
             ESP_LOGE(TAG, "AW9523 连续读失败（%s），复位 I2C 总线", esp_err_to_name(err));
-            i2c_master_bus_reset(s_i2c_bus);
+            if (sensors_mux_begin()) {
+                i2c_master_bus_reset(s_i2c_bus);
+                sensors_mux_end(s_mux_esp_side);
+            }
         }
         return;
     }
@@ -923,7 +926,10 @@ static void aw9523_health_tick(void)
     if (cfg != (0xFF & ~AW9523_P0_MUX_SEL)) {
         ESP_LOGE(TAG, "AW9523 配置丢失（CONFIG_P0=0x%02X，期望 0xFE）——疑似被静电复位，重建",
                  cfg);
-        aw9523_reinit(s_aw9523, s_mux_esp_side);
+        if (sensors_mux_begin()) {
+            esp_err_t recovered=aw9523_reinit(s_aw9523, s_mux_esp_side);
+            sensors_mux_end(recovered==ESP_OK && s_mux_esp_side);
+        }
         return;
     }
     // vsync 探测锁定后 INT_P0 必须保持全屏蔽（INTN 与 LCD CS 共线，重开

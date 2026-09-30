@@ -91,9 +91,7 @@ esp_err_t stc3117_read_current(i2c_master_dev_handle_t dev, float *a) {
     *a = .32f;
     return ESP_OK;
 }
-void stc3117_ensure_running(i2c_master_dev_handle_t dev) {
-    (void)dev;
-}
+
 float batt_log_capacity_mah(void) {
     return 2980;
 }

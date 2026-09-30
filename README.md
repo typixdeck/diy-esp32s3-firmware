@@ -1,15 +1,24 @@
 # TypixDeck DIY ESP32-S3 Firmware
 
-面向 TypixDeck 板载 ESP32-S3 协处理器的独立界面与应用，基于官方固件 `fde9dac` 改造。最新版本 **0.4.1 预发布版**，提供源码、应用镜像、完整镜像及 SHA256 清单，并收录到 [Copilot 在线固件目录](https://github.com/typixdeck/copilot/tree/main/firmware/typixdeck-diy/0.4.1)。
+面向 TypixDeck 板载 ESP32-S3 协处理器的独立界面与应用，基于官方固件 `fde9dac` 改造。最新版本 **0.4.2 预发布版**，提供源码、应用镜像、完整镜像及 SHA256 清单，并收录到 [Copilot 在线固件目录](https://github.com/typixdeck/copilot/tree/main/firmware/typixdeck-diy/0.4.2)。
 
-[下载 0.4.1](https://github.com/typixdeck/diy-esp32s3-firmware/releases/tag/v0.4.1) · [发布说明与验收范围](docs/releases/0.4.1.md)
+[下载 0.4.2](https://github.com/typixdeck/diy-esp32s3-firmware/releases/tag/v0.4.2) · [发布说明与验收范围](docs/releases/0.4.2.md)
+
+## 0.4.2 电量计修正
+
+- 补齐 STC3117 冷启动初始化，并修复旧 DIY 从 0% 起算的已知配置；电压/SOC 曲线分别完整写入正确寄存器。
+- 参考朋友的 [STC3117 优化](https://gitcode.com/LiJinLiJin/stc3117-fuel-gauge)，增加满充判定：必须检测到 USB 供电和先前充电阶段，电压 ≥4.15 V、净电流在 ±100 mA 内持续 30 秒，才校正到 100%。
+- 正常运行时接管已有电量和系数；屏幕切换、通信中断、计数冻结会中断满充观察。显示仅使用新鲜、有效采样，异常显示 `--`。
+- 电量计写入移到单一后台任务，并与 MUX 切换互斥。保留只读诊断；未新增电量计软复位、充电器控制或主机断电操作。
+
+本版通过本地故障注入/回归检查及 ESP-IDF 构建，**尚未刷入真机，`hardware_verified=false`**。原装电池参考参数为 604070 / 4.2 V / 2400 mAh；140 mΩ 为上游参考值，非本机实测。没有启用自动改写容量系数，现有历史续航估算也不写回 STC。详见 [来源、策略与硬件验收](docs/battery.md)。
 
 ## 0.4.1 修正与诊断
 
 - 小乐器启用时将 ES8389 设为单位增益，去掉与软件音量叠加的固定衰减；保留混音余量，退出后恢复 USB 音量和静音状态。
 - Pi 文件/截图请求复用 HTTPS 连接，增加连接、响应及取消的有界处理；旧连接失效时仅重试一次。
 - 主题色同时应用于背景、卡片和边框，暗色界面的文字保持白色/灰色。
-- 新增只读 `TD_BATT v2` 诊断，便于核对电量计原始寄存器和 RAM 校验；**电量显示 0% 的问题尚未修复**。
+- 新增只读 `TD_BATT v2` 诊断，便于核对电量计原始寄存器和 RAM 校验；**0.4.1 本身尚未修复电量初始化，修正见 0.4.2**。
 
 0.4.1 已通过本地行为测试和 ESP-IDF 构建，尚未刷入真机，`hardware_verified=false`。此前 0.4.0 通过应用区写入、完整读回与短时启动检查，但仍收到共享功能、低音量和电量异常反馈；不能将该结果当作 0.4.1 的硬件验收。Copilot 的完整备份/写入/回读流程也仍待验收。
 
@@ -121,8 +130,8 @@ python tools/package.py
 
 产物在 `build/package/`：
 
-- `typixdeck-diy-0.4.1-app.bin`：应用镜像，仅在分区、字体布局兼容时适用。
-- `typixdeck-diy-0.4.1-full.bin`：Bootloader、分区表、应用、字体；完整写入会覆盖 NVS。
+- `typixdeck-diy-0.4.2-app.bin`：应用镜像，仅在分区、字体布局兼容时适用。
+- `typixdeck-diy-0.4.2-full.bin`：Bootloader、分区表、应用、字体；完整写入会覆盖 NVS。
 - `manifest.json`：地址、大小、SHA256、未完成硬件验收标识。
 
 主机行为测试需 C 编译器、Python 3、pkg-config 和 FreeType：

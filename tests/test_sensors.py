@@ -5,11 +5,29 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 headers = {
+    "freertos/FreeRTOS.h": """#pragma once
+#include <stdbool.h>
+#define pdTRUE 1
+#define pdMS_TO_TICKS(x) (x)
+""",
+    "freertos/semphr.h": """#pragma once
+typedef void *SemaphoreHandle_t;
+typedef struct { int unused; } StaticSemaphore_t;
+static inline void *xSemaphoreCreateMutexStatic(StaticSemaphore_t *s) { return s; }
+static inline int xSemaphoreTake(void *s, unsigned ms) { (void)s; (void)ms; return 1; }
+static inline int xSemaphoreGive(void *s) { (void)s; return 1; }
+""",
+    "esp_timer.h": """#pragma once
+#include <stdint.h>
+extern int64_t test_now_ms;
+static inline int64_t esp_timer_get_time(void) { return test_now_ms*1000; }
+""",
     "esp_err.h": """#pragma once
 typedef int esp_err_t;
 #define ESP_OK 0
 #define ESP_FAIL -1
 #define ESP_ERR_INVALID_STATE 259
+#define ESP_ERR_INVALID_ARG 258
 """,
     "esp_check.h": """#pragma once
 #include "esp_err.h"
@@ -34,6 +52,7 @@ harness = r'''
 #include <stdlib.h>
 #include <string.h>
 #include "sensors.h"
+int64_t test_now_ms;
 static int stc_dev, cw_dev, reads, fail_reg=-1, fail_code=ESP_FAIL;
 static uint8_t regs[19], ram[16], cwregs[11];
 esp_err_t i2c_master_transmit(void *dev,const uint8_t *buf,size_t len,int timeout) {
@@ -64,6 +83,7 @@ static void verify_record(char *out,size_t n) {
     assert(field(out,"v")==2);
 }
 int main(void) {
+    sensors_init();
     char out[320];
     regs[0]=0x10; regs[1]=0x80; put16(2,75*512); put16(4,42);
     put16(6,0x3f00); put16(8,1800); put16(13,7200); put16(15,484); put16(17,344);
@@ -106,16 +126,21 @@ int main(void) {
     puts("sensors: read-only diagnostics, shared RAM CRC, signed voltage, bounded records, failed/MUX reads passed");
 }
 '''
-with tempfile.TemporaryDirectory(prefix="typix-sensors-test-") as directory:
-    work = Path(directory)
-    for name, content in headers.items():
-        path = work / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-    (work / "test.c").write_text(harness)
-    subprocess.run([
-        "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
-        f"-I{work}", f"-I{root / 'main'}", str(root / "main/sensors.c"),
-        str(work / "test.c"), "-o", str(work / "test"),
-    ], check=True)
-    subprocess.run([str(work / "test")], check=True)
+def run_test(code, name):
+    with tempfile.TemporaryDirectory(prefix="typix-sensors-test-") as directory:
+        work = Path(directory)
+        for header, content in headers.items():
+            path = work / header
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        (work / "test.c").write_text(code)
+        subprocess.run([
+            "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
+            f"-I{work}", f"-I{root / 'main'}", str(root / "main/sensors.c"),
+            str(root / "main/stc_gauge.c"), str(work / "test.c"), "-o", str(work / name),
+        ], check=True)
+        subprocess.run([str(work / name)], check=True)
+
+if __name__ == "__main__":
+    run_test(harness, "diagnostics")
+    run_test((root / "tests/test_stc_gauge.c").read_text(), "gauge")
