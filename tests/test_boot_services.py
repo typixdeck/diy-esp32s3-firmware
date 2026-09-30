@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Run production startup code against allocation/I/O/reset failure fakes."""
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from host_build import sanitizer_flags
 import subprocess
 import tempfile
 
@@ -21,7 +24,7 @@ for name, (source, headers) in cases.items():
             path.write_text(f'#include "{name}_fakes.h"\n')
         binary = work / 'check'
         subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
-            '-Wno-unused-parameter', '-fsanitize=address,undefined',
+            '-Wno-unused-parameter', *sanitizer_flags(),
             '-fno-omit-frame-pointer', '-I', str(work), '-I', str(root),
             str(root/source), '-lm', '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True)

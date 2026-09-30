@@ -4,7 +4,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from host_build import sanitizer_flags, sanitizer_name
 root = Path(__file__).resolve().parents[1]
+print('Host sanitizers:', sanitizer_name(), flush=True)
 def run(args): subprocess.run(args, cwd=root, check=True)
 run([sys.executable, 'tests/test_net_service.py'])
 run([sys.executable, 'tests/test_pi_share.py'])
@@ -20,6 +22,6 @@ with tempfile.TemporaryDirectory(prefix='typix-check-') as work:
     ]:
         out = str(Path(work)/name)
         run(['cc', '-std=c11', '-D_POSIX_C_SOURCE=200809L', '-Wall', '-Wextra', '-Werror',
-             '-fsanitize=address,undefined', '-Imain', *flags, *sources, '-lm', '-o', out])
+             *sanitizer_flags(), '-Imain', *flags, *sources, '-lm', '-o', out])
         run([out])
 run([sys.executable, 'tools/preview_ui.py'])

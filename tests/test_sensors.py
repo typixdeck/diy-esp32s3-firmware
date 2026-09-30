@@ -1,5 +1,8 @@
 """Compile production sensors.c; forbid all gauge writes during diagnostics."""
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from host_build import sanitizer_flags
 import subprocess
 import tempfile
 
@@ -135,7 +138,7 @@ def run_test(code, name):
             path.write_text(content)
         (work / "test.c").write_text(code)
         subprocess.run([
-            "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
+            "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", *sanitizer_flags(),
             f"-I{work}", f"-I{root / 'main'}", str(root / "main/sensors.c"),
             str(root / "main/stc_gauge.c"), str(work / "test.c"), "-o", str(work / name),
         ], check=True)

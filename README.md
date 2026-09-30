@@ -119,6 +119,8 @@ NTP 默认 `pool.ntp.org`，可修改。时区为 UTC 偏移，支持半小时�
 
 ## 构建与本地验证
 
+在 CM4 上用 ChatGPT 修改内置时钟/MIDI、预览界面并通过 GitHub 同步，见 [语音编程指南](docs/VOICE-CODING.md)。运行 `python3 tools/preview_apps.py` 可查看当前源码生成的应用图片；无需连接 ESP32。当前内置应用还不是可热加载插件。
+
 目标 `esp32s3`，8 MB Flash + 8 MB PSRAM；当前编译验证使用 **ESP-IDF 5.5.1**，依赖记录在 `dependencies.lock`。先激活对应 ESP-IDF 环境，再运行：
 
 ```sh

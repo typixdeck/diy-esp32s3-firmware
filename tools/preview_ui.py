@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import struct
 import zlib
+from host_build import sanitizer_flags, sanitizer_name
 
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
@@ -30,10 +31,10 @@ with tempfile.TemporaryDirectory(prefix='typix-ui-preview-') as work:
     binary = work / 'preview-ui'
     subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Wno-unused-function',
                     '-Wno-unused-variable', '-Wno-missing-field-initializers', '-Wno-sign-compare', '-Wno-misleading-indentation',
-                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
+                    *sanitizer_flags(), '-fno-omit-frame-pointer',
                     '-I', str(work), '-I', str(root/'tools'),
                     str(root/'tools/preview_ui.c'), str(root/'main/ttf_font.c'),
-                    *freetype, '-o', str(binary)], check=True)
+                    *freetype, '-lm', '-o', str(binary)], check=True)
     subprocess.run([str(binary), str(root/'fonts/puhui_subset.ttf'), str(args.output.resolve())], check=True)
 for path in args.output.glob('*.ppm'):
     with path.open('rb') as stream:
@@ -50,6 +51,7 @@ for path in args.output.glob('*.ppm'):
     path.unlink()
 (args.output / 'manifest.json').write_text(json.dumps({
     'kind': 'host-framebuffer-preview', 'hardware_verified': False,
+    'host_sanitizers': sanitizer_name(),
     'firmware_version': re.search(r'set\(PROJECT_VER "([^"]+)"\)',
                                   (root/'CMakeLists.txt').read_text()).group(1),
     'fixtures': 'Synthetic sensor, network, clock, audio and Raspberry Pi state. No hardware or network access.',

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Compile/run isolated host fakes. No device, network or credential access."""
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from host_build import sanitizer_flags
 import subprocess
 import tempfile
 
@@ -19,7 +22,7 @@ with tempfile.TemporaryDirectory(prefix='typix-net-test-') as work:
     binary = work / 'net-test'
     subprocess.run([
         'cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
-        '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
+        *sanitizer_flags(), '-fno-omit-frame-pointer',
         '-I', str(work), '-I', str(root), str(root / 'test_net_service.c'),
         '-o', str(binary),
     ], check=True)

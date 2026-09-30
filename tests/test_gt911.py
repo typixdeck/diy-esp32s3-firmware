@@ -1,5 +1,8 @@
 """Exercise the unchanged production read function with I2C outcomes, no device."""
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from host_build import sanitizer_flags
 import subprocess,tempfile
 root=Path(__file__).parents[1]
 source=(root/'main/gt911.c').read_text()
@@ -42,5 +45,5 @@ int main(void) {
 '''
 with tempfile.TemporaryDirectory(prefix='typix-touch-test-') as work:
     work=Path(work);(work/'test.c').write_text(harness+function+main)
-    subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(work/'test.c'),'-o',str(work/'test')],check=True)
+    subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror',*sanitizer_flags(),str(work/'test.c'),'-o',str(work/'test')],check=True)
     subprocess.run([str(work/'test')],check=True)
