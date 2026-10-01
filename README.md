@@ -1,16 +1,16 @@
 # TypixDeck DIY ESP32-S3 Firmware
 
-面向 TypixDeck 板载 ESP32-S3 协处理器的独立界面与应用，基于官方固件 `fde9dac` 改造。最新公开版本 **0.4.3 预发布版**，提供源码、应用镜像、完整镜像及 SHA256 清单，并收录到 [Copilot 在线固件目录](https://github.com/typixdeck/copilot/tree/main/firmware/typixdeck-diy/0.4.3)。
+面向 TypixDeck 板载 ESP32-S3 协处理器的独立界面与应用，基于官方固件 `fde9dac` 改造。最新公开版本 **0.4.4 预发布版**，提供源码、应用镜像、完整镜像及 SHA256 清单，并收录到 [Copilot 在线固件目录](https://github.com/typixdeck/copilot/tree/main/firmware/typixdeck-diy/0.4.4)。
 
-[下载 0.4.3](https://github.com/typixdeck/diy-esp32s3-firmware/releases/tag/v0.4.3) · [发布说明与验收范围](docs/releases/0.4.3.md)
+[下载 0.4.4](https://github.com/typixdeck/diy-esp32s3-firmware/releases/tag/v0.4.4) · [发布说明与验收范围](docs/releases/0.4.4.md)
 
-## 0.4.4 本地候选：串口优先与保留设置
+## 0.4.4 预发布版：串口优先与保留设置
 
 树莓派状态和协作控制优先走板内 USB CDC：1 秒心跳，断线后只重连原物理端口，串口失联后回退配对 HTTPS。文件和截图仍需要 Wi-Fi。Copilot 0.2.6 可在写入前暂停原来正在运行的 CDC 服务，确认回到同一运行端口后恢复。
 
 兼容的 DIY 升级通过 Copilot 0.2.6 的签名 v2 目录保留 NVS 中 Wi-Fi、时区、配对和外观偏好；必须匹配源应用摘要和完整分区表，不兼容时停止，不自动清空设置。直接把 full.bin 从 0x0 写入仍会重置 NVS。首次启动默认启用 Wi-Fi、UTC+8，无内置私人网络；保存的关闭状态和时区优先。保存网络临时掉线后按 5–60 秒退避重连，认证失败、取消、关闭或忘记网络停止重试。
 
-本地版本和验收边界见 [0.4.4](docs/releases/0.4.4.md)。尚未发布或刷入设备，不能视为真机稳定性验收。
+版本和验收边界见 [0.4.4](docs/releases/0.4.4.md)。已发布；宿主检查、构建和独立审查通过，尚未刷入设备，不能视为真机稳定性验收。
 
 ## 0.4.3 内置应用
 
