@@ -2,11 +2,29 @@
 """Install the rootless companion on Raspberry Pi OS; never flashes the ESP."""
 import argparse
 import ipaddress
+import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import share
+import companion
+
+
+def maintenance_running(path=Path("/var/lib/typix-copilot/status.json")):
+    """Do not start a new CDC owner during a recorded write transaction."""
+    try:
+        info=path.lstat()
+        if info.st_uid!=0 or not path.is_file() or path.is_symlink() or info.st_size>1048576:
+            return True
+        records=json.loads(path.read_text()).get("records",[])
+        if not isinstance(records,list) or (records and not isinstance(records[0],dict)):
+            return True
+        return bool(records and records[0].get("status")=="running")
+    except FileNotFoundError:
+        return False
+    except (OSError,ValueError,TypeError,AttributeError):
+        return True
 
 
 def main():
@@ -17,7 +35,7 @@ def main():
     a=p.parse_args()
     if os.geteuid()==0:p.error("run as desktop user")
     address=str(ipaddress.IPv4Address(a.address))
-    if a.device and (not a.device.startswith("/dev/serial/by-path/") or any(c.isspace() for c in a.device) or '%' in a.device):
+    if a.device and not companion.stable_device(a.device):
         p.error("supply an explicit stable by-path device")
     if not Path("/usr/bin/python3").exists() or not shutil.which("openssl"):
         p.error("requires system Python 3 and openssl")
@@ -56,8 +74,9 @@ WantedBy=default.target
 Description=TypixDeck explicit CDC telemetry
 
 [Service]
-ExecStart=/usr/bin/python3 "%h/.local/share/typixdeck/companion/companion.py" --device "{a.device}"
-Restart=no
+ExecStart=/usr/bin/python3 "%h/.local/share/typixdeck/companion/companion.py" --device "{a.device}" --reconnect
+Restart=on-failure
+RestartSec=2
 NoNewPrivileges=yes
 
 [Install]
@@ -65,9 +84,13 @@ WantedBy=default.target
 ''')
         names.append("typix-companion-cdc.service")
     subprocess.run(["systemctl","--user","daemon-reload"],check=True)
-    if a.start:subprocess.run(["systemctl","--user","enable","--now",*names],check=True)
+    if a.start:
+        if a.device and maintenance_running():
+            names.remove("typix-companion-cdc.service")
+            print("CDC start deferred while Copilot maintenance is active or its status is unreadable; re-run after it finishes.")
+        subprocess.run(["systemctl","--user","enable","--now",*names],check=True)
     print("Installed user services; shared folder: ~/TypixDeck/shared")
     if not display:print("Desktop environment absent: import WAYLAND_DISPLAY before requesting screenshots.")
-    print("Stop typix-companion-cdc.service before pairing or Copilot flashing.")
+    print("Pairing requires stopping CDC; Copilot with CDC coordination pauses/resumes the exact user service.")
 
 if __name__=="__main__":main()

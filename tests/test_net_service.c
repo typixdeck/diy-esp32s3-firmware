@@ -4,12 +4,16 @@
 static void reset_case(void)
 {
     s_work=(net_snapshot_t){0};
+    s_snapshot=(net_snapshot_t){.state=NET_STARTING,.timezone_offset_minutes=DEFAULT_TIMEZONE_MINUTES};
+    strlcpy(s_snapshot.ntp_server,"pool.ntp.org",sizeof(s_snapshot.ntp_server));
     strlcpy(s_work.ntp_server,"pool.ntp.org",sizeof(s_work.ntp_server));
     s_started=false;s_ready=false;s_setup_attempted=false;s_connecting=false;s_scan_active=false;s_sntp_active=false;
     mock_wifi_init_calls=0;mock_wifi_init_fail=false;
     s_retries=0;mock_now=0;mock_associated=false;mock_nvs_fail=false;
     mock_connect_calls=mock_ntp_starts=mock_ntp_stops=mock_nvs_saves=0;
     mock_saved_size=0;mock_enabled=0;
+    mock_enabled_present=false;mock_timezone_present=false;mock_ntp_server[0]=0;
+    s_reconnect_at=0;s_reconnect_delay=RECONNECT_MIN_US;s_saved_attempt=false;
     memset(&mock_config,0,sizeof(mock_config));
     clear_candidate();
 }
@@ -34,6 +38,11 @@ int main(void)
 
     reset_case();
     load_preferences();
+    assert(s_work.enabled&&s_ready&&mock_wifi_init_calls==1);
+    assert(s_work.timezone_offset_minutes==480&&!s_connecting); // no factory credentials
+
+    reset_case();mock_enabled_present=true; // explicit user choice: remain off
+    load_preferences();
     assert(s_work.state==NET_OFF&&!s_ready&&!mock_wifi_init_calls);
     handle_command(&(command_t){.kind=CMD_ENABLE,.enabled=true});
     assert(s_work.enabled&&s_ready&&mock_wifi_init_calls==1);
@@ -42,7 +51,7 @@ int main(void)
     handle_command(&(command_t){.kind=CMD_ENABLE,.enabled=true});
     assert(mock_wifi_init_calls==1);
 
-    reset_case();mock_enabled=1;
+    reset_case();mock_enabled=1;mock_enabled_present=true;
     load_preferences();
     assert(s_work.enabled&&mock_wifi_init_calls==1);
 
@@ -84,6 +93,41 @@ int main(void)
     check_deadlines(CONNECT_TIMEOUT_US);
     assert(!s_connecting&&s_work.last_error==NET_ERROR_TIMEOUT&&!mock_nvs_saves);
     assert(!mock_config.sta.password[0]);
+
+    // Model a normal reboot by discarding runtime state, retaining NVS only.
+    reset_case();
+    connect_network("test-network","test-password");mock_associated=true;
+    handle_event(&(event_t){.kind=EVENT_IP});
+    handle_command(&(command_t){.kind=CMD_TIME_CONFIG,.server="time.example.test",.timezone=-330});
+    s_started=s_ready=s_setup_attempted=s_connecting=s_scan_active=s_sntp_active=false;
+    mock_associated=false;
+    load_preferences();
+    assert(s_connecting&&s_saved_attempt&&s_work.enabled&&s_work.timezone_offset_minutes==-330);
+    assert(!strcmp(s_work.ntp_server,"time.example.test"));
+    mock_associated=true;handle_event(&(event_t){.kind=EVENT_IP});
+    assert(s_work.connected&&mock_nvs_saves==1); // no Flash rewrite on saved reconnect
+    mock_associated=false;handle_event(&(event_t){.kind=EVENT_DISCONNECT,.reason=1});
+    assert(!s_work.connected&&s_reconnect_at==RECONNECT_MIN_US);
+    int before=mock_connect_calls;
+    mock_now=RECONNECT_MIN_US-1;check_deadlines(mock_now);assert(mock_connect_calls==before);
+    mock_now++;check_deadlines(mock_now);assert(mock_connect_calls==before+1&&s_saved_attempt);
+    mock_associated=true;handle_event(&(event_t){.kind=EVENT_IP});
+    assert(s_work.connected&&mock_nvs_saves==1&&s_reconnect_delay==RECONNECT_MIN_US);
+    mock_associated=false;handle_event(&(event_t){.kind=EVENT_DISCONNECT,.reason=1});
+    handle_command(&(command_t){.kind=CMD_CANCEL});
+    before=mock_connect_calls;mock_now+=RECONNECT_MAX_US;check_deadlines(mock_now);
+    assert(mock_connect_calls==before&&!s_reconnect_at);
+    handle_command(&(command_t){.kind=CMD_ENABLE,.enabled=true});
+    handle_event(&(event_t){.kind=EVENT_DISCONNECT,.reason=WIFI_REASON_AUTH_FAIL});
+    assert(!s_reconnect_at&&s_work.last_error==NET_ERROR_AUTH); // no password hammering
+    handle_command(&(command_t){.kind=CMD_ENABLE,.enabled=false});
+    s_started=s_ready=s_setup_attempted=false;s_snapshot.enabled=false;load_preferences();
+    assert(!s_work.enabled&&!s_ready&&s_work.timezone_offset_minutes==-330);
+
+    reset_case();mock_enabled_present=true;mock_enabled=9;
+    mock_timezone_present=true;mock_timezone=900;
+    strcpy(mock_ntp_server,"https://invalid/");load_preferences();
+    assert(s_work.enabled&&s_work.timezone_offset_minutes==480&&!strcmp(s_work.ntp_server,"pool.ntp.org"));
 
     reset_case();
     connect_network("test-network","test-password");

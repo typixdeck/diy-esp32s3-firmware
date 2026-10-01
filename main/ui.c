@@ -1378,7 +1378,7 @@ static void draw_sensors(void) {
     dash_data_t d; dash_read(&d); sensors_probe_maybe();
     if (s_topo_detail) { draw_topo_detail(); return; }
     net_snapshot_t net; net_service_get_snapshot(&net);
-    pi_link_snapshot_t pi; pi_link_get_snapshot(&pi); pi_share_get_status(&pi);
+    pi_link_snapshot_t pi; pi_share_get_preferred_status(&pi);
     uint16_t power = p->warn, usb = p->accent2, bus = p->good, video = RGB(164, 133, 224);
     draw_txt(24, 103, 22, p->text, "TYPIXDECK / LIVE");
     const char *legend[] = {tr("Power", "供电"), "USB/I2S", "I2C", tr("Display", "显示")};
@@ -1532,7 +1532,7 @@ static void draw_pi(void) {
     const theme_pal_t *p=pal();
     pi_link_snapshot_t link; pi_link_get_snapshot(&link);
     pi_link_snapshot_t serial=link;
-    pi_share_get_status(&link);
+    pi_share_get_preferred_status(&link);
     bool can_shutdown=serial.online && serial.can_shutdown && !serial.shutdown_pending;
     if (!link.online && pi_info_fresh()) {
         char raw[32]; link.online=true; link.transport=1;
@@ -1582,8 +1582,8 @@ static void draw_pi(void) {
             draw_txt_fit(28,603,18,970,p->warn,results[serial.shutdown_result]);
         }
         draw_txt_fit(28,635,19,970,p->text2,
-                     tr("Wi-Fi first · USB CDC fallback · no heartbeat does not mean power off",
-                        "优先 Wi-Fi · USB CDC 备用 · 无心跳不代表已关机"));
+                     tr("USB CDC first · Wi-Fi fallback · no heartbeat does not mean power off",
+                        "优先 USB CDC · Wi-Fi 备用 · 无心跳不代表已关机"));
         snprintf(value,sizeof(value),"DPI %.1f Hz / HDMI FPS --",vsync_mon_fps());
         draw_txt(28,675,19,p->dim,value);
         draw_txt(28,711,17,p->dim,tr("DPI: last startup measurement, not live FPS","DPI：启动时测量值，非实时 FPS"));

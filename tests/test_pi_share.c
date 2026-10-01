@@ -1,6 +1,8 @@
 #include "../main/pi_share.c"
 static net_snapshot_t mock_net={.connected=true,.time_valid=true};
 void net_service_get_snapshot(net_snapshot_t*out) { *out=mock_net; }
+static pi_link_snapshot_t mock_serial;
+void pi_link_get_snapshot(pi_link_snapshot_t *out) { *out=mock_serial; }
 static void pump(const char *line) {
     pi_share_receive(line);
     if(!setjmp(pump_exit))worker(NULL);
@@ -31,7 +33,14 @@ int main(void) {
     char bad[]="../x 1\n";assert(!parse_files(bad,&list));
     mock_body="TD2 STATUS 42 43000 1200000 192.0.2.1 100 200 32\n";read_status();
     pi_link_snapshot_t status;assert(pi_share_get_status(&status)&&status.transport==2&&status.mem_mib==100);
+    mock_serial=(pi_link_snapshot_t){.online=true,.transport=1,.cpu_khz=600000,.can_shutdown=true};
+    assert(!status_poll_needed());
+    pi_share_get_preferred_status(&status);assert(status.transport==1&&status.cpu_khz==600000&&status.can_shutdown);
+    mock_serial.online=false;mock_serial.transport=0;
+    assert(status_poll_needed());
+    pi_share_get_preferred_status(&status);assert(status.transport==2&&status.mem_mib==100&&!status.can_shutdown);
     mock_now+=8000000;assert(!pi_share_get_status(&status));
+    pi_share_get_preferred_status(&status);assert(!status.online&&status.transport==0);
     mock_body="TD2 STATUS 42 43000 1200000 999.0.2.1 100 200 32\n";read_status();assert(!pi_share_get_status(&status));
     pi_share_receive("TDPAIR BEGIN 192.0.2.1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     pi_share_receive("TDPAIR CERT 1 Q0VSVA==");pump("TDPAIR COMMIT");assert(!saved_size);

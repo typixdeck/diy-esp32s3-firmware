@@ -5,6 +5,7 @@ idf_component_register(
     EMBED_FILES "../fonts/special_elite_subset.ttf"
     REQUIRES driver esp_lcd esp_timer esp_app_format esp_driver_i2s esp_hw_support usb_device_uac
              esp_http_client mbedtls espressif__tinyusb esp_partition nvs_flash esp_wifi esp_netif esp_event lwip
+             espressif__esp_codec_dev espressif__freetype
 )
 
 # UAC+CDC composite（仍是 non-AS_PART 路径）：描述符 / tusb_config 由

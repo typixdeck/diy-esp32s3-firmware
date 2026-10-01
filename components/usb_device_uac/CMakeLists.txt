@@ -1,4 +1,9 @@
 set(priv_requires esp_timer)
+if(NOT CONFIG_USB_DEVICE_UAC_AS_PART)
+    # Explicit dependency also permits offline builds with already resolved
+    # managed sources: tinyusb's target must exist before extending it below.
+    list(APPEND priv_requires espressif__tinyusb espressif__cmake_utilities)
+endif()
 
 if(${IDF_VERSION_MAJOR} LESS 6)
     list(APPEND priv_requires usb)       # USB PHY is part of usb component in IDF < 6.0

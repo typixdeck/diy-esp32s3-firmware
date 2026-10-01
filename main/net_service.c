@@ -20,6 +20,9 @@
 #define SCAN_TIMEOUT_US (12LL * 1000000)
 #define NTP_TIMEOUT_US (20LL * 1000000)
 #define MAX_CONNECT_RETRIES 2
+#define RECONNECT_MIN_US (5LL * 1000000)
+#define RECONNECT_MAX_US (60LL * 1000000)
+#define DEFAULT_TIMEZONE_MINUTES 480 // Factory default; never replaces a saved offset.
 #define CLOCK_EPOCH_MIN 1704067200LL // 2024-01-01; rejects unset Unix epoch.
 
 typedef enum {
@@ -60,6 +63,9 @@ static int s_retries;
 static int64_t s_connect_deadline;
 static int64_t s_scan_deadline;
 static int64_t s_ntp_deadline;
+static int64_t s_reconnect_at;
+static int64_t s_reconnect_delay = RECONNECT_MIN_US;
+static bool s_saved_attempt;
 static char s_candidate_ssid[NET_SSID_SIZE];
 static char s_candidate_password[65];
 static esp_event_handler_instance_t s_wifi_handler;
@@ -291,17 +297,37 @@ static void connect_network(const char *ssid, const char *password)
     }
 }
 
+static void schedule_reconnect(void);
+
 static void reconnect_saved(void)
 {
     char ssid[NET_SSID_SIZE] = {0};
     char password[65] = {0};
-    if (load_network(ssid, password)) connect_network(ssid, password);
+    if (load_network(ssid, password)) {
+        connect_network(ssid, password);
+        s_saved_attempt = s_connecting;
+        if (!s_connecting && s_work.last_error != NET_ERROR_INIT) schedule_reconnect();
+    }
     erase_secret(password, sizeof(password));
+}
+
+static void schedule_reconnect(void)
+{
+    if (!s_work.enabled || !s_work.saved_network) return;
+    s_reconnect_at = esp_timer_get_time() + s_reconnect_delay;
+    s_reconnect_delay *= 2;
+    if (s_reconnect_delay > RECONNECT_MAX_US) s_reconnect_delay = RECONNECT_MAX_US;
 }
 
 static void handle_command(const command_t *cmd)
 {
     s_work.last_error = NET_ERROR_NONE;
+    // Explicit user actions supersede a queued automatic attempt. Cancel/off/
+    // forget must not unexpectedly reconnect after their completion.
+    if (cmd->kind != CMD_NTP && cmd->kind != CMD_TIME_CONFIG) {
+        s_reconnect_at = 0;
+        s_reconnect_delay = RECONNECT_MIN_US;
+    }
     switch (cmd->kind) {
     case CMD_ENABLE:
         if (cmd->enabled) {
@@ -327,6 +353,7 @@ static void handle_command(const command_t *cmd)
         }
         break;
     case CMD_CONNECT:
+        s_saved_attempt = false;
         connect_network(cmd->ssid, cmd->password);
         break;
     case CMD_CANCEL:
@@ -394,10 +421,17 @@ static void handle_event(const event_t *event)
         if (s_connecting) {
             if (!auth_failure(event->reason) && s_retries++ < MAX_CONNECT_RETRIES &&
                 esp_timer_get_time() < s_connect_deadline && esp_wifi_connect() == ESP_OK) break;
+            bool retry_saved = s_saved_attempt && !auth_failure(event->reason);
+            disconnect();
+            s_saved_attempt = false;
+            s_work.last_error = auth_failure(event->reason) ? NET_ERROR_AUTH : NET_ERROR_WIFI;
+            if (retry_saved) schedule_reconnect();
+        }
+        if (was_connected) {
             disconnect();
             s_work.last_error = auth_failure(event->reason) ? NET_ERROR_AUTH : NET_ERROR_WIFI;
+            if (!auth_failure(event->reason)) schedule_reconnect();
         }
-        if (was_connected) s_work.last_error = NET_ERROR_WIFI;
         break;
     }
     case EVENT_IP: {
@@ -410,8 +444,15 @@ static void handle_event(const event_t *event)
         if (!s_connecting) break; // DHCP renewal: update IP, do not resave credentials.
         s_connecting = false;
         s_work.connected = true;
-        if (save_network()) s_work.saved_network = true;
-        else s_work.last_error = NET_ERROR_STORAGE;
+        // Reconnecting a saved network must not rewrite credentials every time
+        // an AP drops out. Only a newly entered, successful network is saved.
+        if (!s_saved_attempt) {
+            if (save_network()) s_work.saved_network = true;
+            else s_work.last_error = NET_ERROR_STORAGE;
+        }
+        s_saved_attempt = false;
+        s_reconnect_at = 0;
+        s_reconnect_delay = RECONNECT_MIN_US;
         clear_candidate();
         // First connection performs one bounded clock sync; no forever retry loop.
         net_error_t connection_error = s_work.last_error;
@@ -494,8 +535,11 @@ static esp_err_t setup_wifi(void)
 static void check_deadlines(int64_t now)
 {
     if (s_connecting && now >= s_connect_deadline) {
+        bool retry_saved = s_saved_attempt;
         disconnect();
+        s_saved_attempt = false;
         s_work.last_error = NET_ERROR_TIMEOUT;
+        if (retry_saved) schedule_reconnect();
     }
     if (s_scan_active && now >= s_scan_deadline) {
         stop_scan();
@@ -505,15 +549,21 @@ static void check_deadlines(int64_t now)
         stop_ntp();
         s_work.last_error = NET_ERROR_TIMEOUT;
     }
+    if (s_reconnect_at && now >= s_reconnect_at && !s_connecting && !s_scan_active) {
+        s_reconnect_at = 0;
+        if (s_work.enabled && s_work.saved_network) reconnect_saved();
+    }
 }
 
 static void load_preferences(void)
 {
     s_work = s_snapshot;
     nvs_handle_t handle;
-    uint8_t enabled = 0;
+    uint8_t enabled = 1;
     if (nvs_open("deck_net", NVS_READONLY, &handle) == ESP_OK) {
-        nvs_get_u8(handle, "enabled", &enabled);
+        uint8_t stored_enabled;
+        if (nvs_get_u8(handle, "enabled", &stored_enabled) == ESP_OK && stored_enabled <= 1)
+            enabled = stored_enabled;
         int32_t tz = 0;
         if (nvs_get_i32(handle, "tz_min", &tz) == ESP_OK && tz >= -720 && tz <= 840)
             s_work.timezone_offset_minutes = tz;
@@ -560,7 +610,8 @@ esp_err_t net_service_init(void)
     s_commands = xQueueCreate(4, sizeof(command_t *));
     s_events = xQueueCreate(12, sizeof(event_t));
     if (!s_lock || !s_commands || !s_events) goto failed;
-    s_snapshot = (net_snapshot_t){.state = NET_STARTING};
+    s_snapshot = (net_snapshot_t){.state = NET_STARTING,
+        .timezone_offset_minutes = DEFAULT_TIMEZONE_MINUTES};
     strlcpy(s_snapshot.ntp_server, "pool.ntp.org", sizeof(s_snapshot.ntp_server));
     if (xTaskCreate(network_task, "deck_net", 6144, NULL, 3, NULL) != pdPASS) goto failed;
     return ESP_OK;

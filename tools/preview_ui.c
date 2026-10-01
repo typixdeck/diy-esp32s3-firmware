@@ -182,9 +182,10 @@ bool pi_link_request_shutdown(void) {
 }
 
 static pi_share_snapshot_t fixture_share={.configured=true};
-static const char *fixture_file="Preview file / synthetic data only.\nWi-Fi first; CDC telemetry fallback.\n";
+static const char *fixture_file="Preview file / synthetic data only.\nCDC first; Wi-Fi telemetry fallback.\n";
 void pi_share_get_snapshot(pi_share_snapshot_t *out) { *out=fixture_share; }
 bool pi_share_get_status(pi_link_snapshot_t *out) { (void)out; return false; }
+void pi_share_get_preferred_status(pi_link_snapshot_t *out) { pi_link_get_snapshot(out); }
 bool pi_share_request(pi_share_kind_t kind,const char *name) { (void)name;fixture_share.kind=kind;return true; }
 void pi_share_cancel(void) {}
 void pi_share_forget(void) { fixture_share.configured=false; }

@@ -11,11 +11,18 @@ import secrets
 import select
 import stat
 import subprocess
+import threading
 import termios
 import time
 import tty
 
 NONCE = re.compile(r"[0-9a-f]{16}\Z")
+RECONNECT_DELAY = 2.0
+
+
+def stable_device(path: str) -> bool:
+    """Only a previously verified physical by-path may be reopened."""
+    return bool(re.fullmatch(r"/dev/serial/by-path/[A-Za-z0-9][A-Za-z0-9_.:+-]{0,254}", path))
 
 
 def shutdown_allowed() -> bool:
@@ -63,6 +70,73 @@ def telemetry() -> tuple[int, int, int]:
     temperature = read_int("/sys/class/thermal/thermal_zone0/temp", 0, 200000)
     frequency = read_int("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", 0, 10000000)
     return uptime, temperature, frequency
+
+
+def system_values() -> tuple[str, int, int, int]:
+    from share import system_info
+    return system_info(Path.home() / "TypixDeck/shared")
+
+
+class LocalStatus:
+    """Keep bounded route/login1 subprocesses out of the one-second CDC loop."""
+    def __init__(self, allow_shutdown: bool):
+        self.allow_shutdown = allow_shutdown
+        self.values = ("-", -1, -1, -1)
+        self.authorized = False
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.run, name="typix-local-status", daemon=True)
+
+    def refresh(self):
+        values = system_values()
+        authorized = self.allow_shutdown and shutdown_allowed()
+        with self.lock:
+            self.values, self.authorized = values, authorized
+
+    def run(self):
+        while not self.stop.is_set():
+            try:
+                self.refresh()
+            except (OSError, ValueError, subprocess.SubprocessError):
+                with self.lock:
+                    self.values, self.authorized = ("-", -1, -1, -1), False
+            if self.stop.wait(2):
+                break
+
+    def snapshot(self):
+        with self.lock:
+            return self.values, self.authorized
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stop.set()
+        self.thread.join(timeout=5)
+
+
+class LineReader:
+    """Discard binary/log noise without retaining the raw CDC stream."""
+    def __init__(self):
+        self.buffer = bytearray()
+        self.discard = False
+
+    def feed(self, data: bytes):
+        lines = []
+        for byte in data:
+            if byte in (10, 13):
+                if not self.discard and self.buffer:
+                    lines.append(self.buffer.decode("ascii"))
+                self.buffer.clear()
+                self.discard = False
+            elif not self.discard:
+                if 32 <= byte <= 126 and len(self.buffer) < 158:
+                    self.buffer.append(byte)
+                else:
+                    self.buffer.clear()
+                    self.discard = True
+        return lines
 
 
 class Session:
@@ -147,26 +221,20 @@ def send(fd: int, line: str) -> None:
         remaining = remaining[count:]
 
 
-def run_connection(fd: int, allow_shutdown: bool) -> None:
+def run_connection(fd: int, allow_shutdown: bool, local: LocalStatus) -> None:
     session = Session(allow_shutdown=allow_shutdown)
-    buffer = bytearray()
-    discard = False
-    hello_at = heartbeat_at = authorization_at = 0.0
-    authorized = False
+    reader = LineReader()
+    hello_at = heartbeat_at = 0.0
     while True:
         now = time.monotonic()
         if now >= hello_at:
             send(fd, session.hello())
             hello_at = now + 2
-        if now >= authorization_at:
-            authorized = allow_shutdown and shutdown_allowed()
-            authorization_at = now + 5
         if now >= heartbeat_at:
+            (ip, mem, disk, load), authorized = local.snapshot()
             line = session.heartbeat(authorized, telemetry())
             if line:
                 send(fd, line)
-                from share import system_info
-                ip, mem, disk, load = system_info(Path.home() / "TypixDeck/shared")
                 send(fd, f"TD1 SYS {session.host} {session.device} {session.sequence} {ip} {mem} {disk} {load}\n")
             heartbeat_at = now + 1
         if not select.select([fd], [], [], 0.1)[0]:
@@ -177,38 +245,44 @@ def run_connection(fd: int, allow_shutdown: bool) -> None:
             continue
         if not data:
             raise OSError("CDC disconnected")
-        for byte in data:
-            if byte in (10, 13):
-                if not discard and buffer:
-                    try:
-                        response = session.receive(buffer.decode("ascii"))
-                    except UnicodeError:
-                        response = None
-                    if response:
-                        send(fd, response)
-                buffer.clear()
-                discard = False
-            elif not discard:
-                if 32 <= byte <= 126 and len(buffer) < 158:
-                    buffer.append(byte)
-                else:
-                    buffer.clear()
-                    discard = True
+        for line in reader.feed(data):
+            response = session.receive(line)
+            if response:
+                send(fd, response)
+
+
+def run_device(path: str, allow_shutdown: bool, reconnect: bool) -> None:
+    if reconnect and not stable_device(path):
+        raise ValueError("reconnect requires an explicit verified by-path device")
+    with LocalStatus(allow_shutdown) as local:
+        while True:
+            fd = None
+            try:
+                fd = open_device(path)
+                # Every reopened connection gets a fresh Session, never an old command.
+                run_connection(fd, allow_shutdown, local)
+            except (OSError, TimeoutError):
+                if not reconnect:
+                    raise
+            finally:
+                if fd is not None:
+                    os.close(fd)
+            if not reconnect:
+                return
+            time.sleep(RECONNECT_DELAY)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", required=True, help="explicit, verified /dev/serial/by-path/... path")
     parser.add_argument("--allow-shutdown", action="store_true", help="allow only already-authorized, noninteractive Linux poweroff")
+    parser.add_argument("--reconnect", action="store_true", help="reopen only the same verified physical by-path after reconnect")
     args = parser.parse_args()
     if os.geteuid() == 0:
         parser.error("run as a regular user; never keep this bridge as root")
-    # Exit on disconnect instead of silently reopening a potentially different board.
-    fd = open_device(args.device)
-    try:
-        run_connection(fd, args.allow_shutdown)
-    finally:
-        os.close(fd)
+    if args.reconnect and not stable_device(args.device):
+        parser.error("--reconnect requires an explicit verified /dev/serial/by-path/... path")
+    run_device(args.device, args.allow_shutdown, args.reconnect)
 
 
 if __name__ == "__main__":

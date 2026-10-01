@@ -54,7 +54,9 @@ size_t net_service_format_diagnostics(char *out, size_t capacity);
 
 // Commands are queued, never block the UI, and return false for invalid input,
 // uninitialized service, or a full queue. Completion is visible in the snapshot.
-// A saved successful network reconnects at boot only when Wi-Fi was left enabled.
+// First boot defaults to Wi-Fi available (no embedded credentials), UTC+08:00.
+// Explicit off and all saved preferences survive reboot. Transient saved-network
+// failures retry with 5..60s backoff; auth failure/off/cancel stop automatic retry.
 bool net_service_set_enabled(bool enabled);
 bool net_service_scan(void);
 bool net_service_connect(const char *ssid, const char *password);

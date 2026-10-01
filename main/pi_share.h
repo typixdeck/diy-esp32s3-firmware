@@ -24,6 +24,8 @@ void pi_share_receive(const char *line);
 bool pi_share_take_tx(char *out, size_t capacity);
 void pi_share_get_snapshot(pi_share_snapshot_t *out);
 bool pi_share_get_status(pi_link_snapshot_t *out); /* fresh HTTPS only */
+/* Fresh CDC first; HTTPS is the read-only fallback. Never merges shutdown rights. */
+void pi_share_get_preferred_status(pi_link_snapshot_t *out);
 bool pi_share_request(pi_share_kind_t kind, const char *name);
 void pi_share_cancel(void);
 void pi_share_forget(void);

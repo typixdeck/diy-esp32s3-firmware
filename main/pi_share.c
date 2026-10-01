@@ -137,6 +137,11 @@ static void read_status(void) {
     }
     free(body);
 }
+static bool status_poll_needed(void) {
+    pi_link_snapshot_t serial;
+    pi_link_get_snapshot(&serial);
+    return !serial.online;
+}
 static bool parse_files(char *body, pi_share_snapshot_t *state) {
     char *save=NULL;
     for (char *line=strtok_r(body,"\n",&save); line; line=strtok_r(NULL,"\n",&save)) {
@@ -244,7 +249,7 @@ static void worker(void *arg) {
             }
             UNLOCK(); free(data);
         }
-        if (!pairing && s_config.version==1 && esp_timer_get_time()>=poll_at) {
+        if (!pairing && s_config.version==1 && status_poll_needed() && esp_timer_get_time()>=poll_at) {
             read_status(); poll_at=esp_timer_get_time()+2000000;
         }
     }
@@ -272,10 +277,15 @@ void pi_share_get_snapshot(pi_share_snapshot_t *out) {
     LOCK(); *out=s_state; UNLOCK();
 }
 bool pi_share_get_status(pi_link_snapshot_t *out) {
-    if (!s_lock) return false;
+    if (!s_lock || !out) return false;
     LOCK(); int64_t age=esp_timer_get_time()-s_status_at;
     bool fresh=s_status_at>0 && age<8000000;
     if (fresh) { *out=s_status; out->age_ms=age/1000; } UNLOCK(); return fresh;
+}
+void pi_share_get_preferred_status(pi_link_snapshot_t *out) {
+    if (!out) return;
+    pi_link_get_snapshot(out);
+    if (!out->online) pi_share_get_status(out);
 }
 bool pi_share_request(pi_share_kind_t kind,const char *name) {
     if (!s_queue || kind<SHARE_LIST || kind>SHARE_SCREEN || (kind==SHARE_FILE && (!name || !valid_name(name)))) return false;

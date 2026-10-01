@@ -25,11 +25,16 @@ unmounted storage, CM4 power removal, safe AW/GPIO control, or completed shutdow
 Missing ACK or USB disconnection is also not proof of safe shutdown. Resume-from-RAM,
 hardware startup, PMIC/GLOBAL_EN control and display blanking are not implemented here.
 
-The process takes an advisory exclusive lock on the chosen tty and exits on connection
-loss. It does not automatically open a newly enumerated device. Stop this process before
-Copilot flashing, serial diagnosis or any other CDC owner; other tools must cooperate
-with the lock. Clearing HUPCL avoids close-time hangup, but opening a serial device is
-not proof of electrically side-effect-free USB line state on every firmware.
+The process takes an advisory exclusive lock on the chosen tty. A one-shot invocation
+exits on connection loss. The installed user service uses `--reconnect`: it waits two
+seconds and reopens only the same explicitly verified `/dev/serial/by-path/...` physical
+port/interface, with a fresh session and no replay of old commands. It never searches
+for the first ttyACM or chooses a new USB path. Stop it before pairing or serial diagnosis.
+Copilot versions with CDC coordination stop this exact user service before acquiring the
+port and restore it only when it was previously active and the verified runtime returns;
+older Copilot versions still require stopping/restarting the service manually. Clearing
+HUPCL avoids close-time hangup, but opening a serial device is not proof of electrically
+side-effect-free USB line state on every firmware.
 
 No keyboard data, raw serial stream, hardware identity or usage data is saved or sent.
 Unrecognized lines and binary data are discarded. Only short protocol lines are parsed.
@@ -37,8 +42,8 @@ Unrecognized lines and binary data are discarded. Only short protocol lines are 
 ## Optional user service
 
 After verifying the path, place a user unit under `~/.config/systemd/user/` with an
-absolute Python/script path and explicit port. The example is read-only and does not
-auto-restart after disconnect:
+absolute Python/script path and explicit port. The example is read-only and reconnects
+the same verified physical path:
 
 ```ini
 [Unit]
@@ -46,8 +51,9 @@ Description=TypixDeck local telemetry
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /ABSOLUTE/PATH/host/companion.py --device /dev/serial/by-path/YOUR_VERIFIED_PORT
-Restart=no
+ExecStart=/usr/bin/python3 /ABSOLUTE/PATH/host/companion.py --device /dev/serial/by-path/YOUR_VERIFIED_PORT --reconnect
+Restart=on-failure
+RestartSec=2
 NoNewPrivileges=yes
 
 [Install]
@@ -69,6 +75,7 @@ with access to the same serial device.
 TD1 HELLO <host_nonce>
 TD1 WELCOME <host_nonce> <device_nonce>
 TD1 HB <host_nonce> <device_nonce> <seq> <shutdown_cap_0_or_1> <uptime_s> <cpu_mC> <cpu_kHz>
+TD1 SYS <host_nonce> <device_nonce> <seq> <ip_or_-> <available_mem_MiB> <available_disk_MiB> <load_x100>
 TD1 CMD <host_nonce> <device_nonce> 1 SHUTDOWN
 TD1 ACK <host_nonce> <device_nonce> 1 ACCEPTED|DENIED|FAILED
 ```
@@ -78,6 +85,13 @@ capability. Freshness lasts 8 seconds. Commands expire after 15 seconds if unans
 are never resent, and only one shutdown request is allowed per host connection,
 including failed requests. Reconnect establishes fresh nonces; an old ACK cannot
 complete a new session's request. The firmware never performs hard-power actions.
+
+One heartbeat and its matching `SYS` line are sent each second. `SYS` uses the same
+nonce/sequence as the accepted heartbeat; invalid IPs, out-of-range or stale fields are
+rejected. Route and login1 queries run separately and update a bounded cached sample,
+so their subprocess timeouts do not pause the serial heartbeat. Unavailable readings
+remain `-1`; no screen FPS is fabricated. CDC is preferred while fresh, so status does
+not require Wi-Fi, pairing or NTP. HTTPS status polling pauses during fresh CDC telemetry.
 
 ## Local tests
 
@@ -127,12 +141,15 @@ traffic. Unfinished pairing leaves the previous pairing intact. The ESP "Forget 
 action erases only this companion entry from NVS (not Wi-Fi). Pairing is local access control,
 not physical Flash encryption. NVS remains unencrypted.
 
-For CDC fallback, re-run the installer with `--device /dev/serial/by-path/YOUR_VERIFIED_PORT`
-and `--start`. **Stop `typix-companion-cdc.service` before Copilot/other flashing, and restart
-it after the verified runtime device returns.** The service does not reopen or select a
-new tty after a disconnect. HTTPS telemetry wins while fresh; CDC telemetry becomes active
-after Wi-Fi status expires (8 seconds). File/screenshot transfers currently require Wi-Fi;
-CDC fallback only carries status and existing opt-in shutdown messages.
+For serial-first status, re-run the installer with `--device /dev/serial/by-path/YOUR_VERIFIED_PORT`
+and `--start`. The service reopens only that physical path/interface after disconnect.
+**Older Copilot and other flashing tools still require stopping the CDC service first.**
+Copilot with CDC coordination handles the exact user service automatically; unresolved
+ROM mode leaves it stopped. The installer defers starting a new CDC owner when Copilot's
+maintenance status is running or unreadable; re-run it after maintenance if needed.
+Fresh CDC telemetry wins immediately; HTTPS is the fallback after serial status expires
+(8 seconds). File/screenshot transfers currently require Wi-Fi; CDC carries status and
+existing opt-in shutdown messages, not binary files or pictures.
 
 - Put files in `~/TypixDeck/shared/`. Names: 1–40 safe ASCII letters/digits/`._-`, starting
   with a letter or digit; max 24 listed files, 256 KiB each; no symlinks or subdirectories.
@@ -164,8 +181,8 @@ at `/usr/local/lib/typixdeck/touch_reprobe.py` and units under `/etc/systemd/sys
 separate from the rootless companion installer. On the acceptance CM4, product ID 911 was
 read and `Goodix Capacitive TouchScreen` registered successfully. The user confirmed Pi desktop touch input recovered. Disable with `sudo systemctl disable --now typix-touch-reprobe.timer`.
 
-Deployment note (2026-09-30): HTTPS is active on the acceptance CM4; the CDC daemon is
-not enabled permanently. Copilot currently rejects a tty already owned by another process.
-Automatic pause/resume coordination is not yet implemented; do not enable CDC and then
-expect concurrent flashing to work. The rootless CDC script remains available for bounded
-telemetry sessions with explicit serial ownership.
+Deployment note: HTTPS was active on the acceptance CM4 on 2026-09-30; the CDC daemon
+was deliberately not enabled because the then-installed Copilot could not pause it.
+The serial-first source and coordinated writer need to be installed together before
+enabling the permanent CDC unit. Local tests verify the preference/reconnect logic,
+not CM4 USB timing or long-term hardware stability.

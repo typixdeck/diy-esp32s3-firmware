@@ -58,6 +58,9 @@ static wifi_config_t mock_config;
 static unsigned char mock_saved[256];
 static size_t mock_saved_size;
 static uint8_t mock_enabled;
+static bool mock_enabled_present, mock_timezone_present;
+static int32_t mock_timezone;
+static char mock_ntp_server[64];
 static wifi_ap_record_t mock_aps[8];
 static uint16_t mock_ap_count;
 static int mock_wifi_init_calls;
@@ -103,11 +106,11 @@ static esp_err_t nvs_open(const char *name,int flags,nvs_handle_t *handle){(void
 static void nvs_close(nvs_handle_t handle){(void)handle;}
 static esp_err_t nvs_set_blob(nvs_handle_t handle,const char *key,const void *data,size_t size){(void)handle;assert(!strcmp(key,"network"));memcpy(mock_saved,data,size);mock_saved_size=size;mock_nvs_saves++;return ESP_OK;}
 static esp_err_t nvs_get_blob(nvs_handle_t handle,const char *key,void *data,size_t *size){(void)handle;(void)key;if(!mock_saved_size)return ESP_ERR_NVS_NOT_FOUND;if(data){if(*size<mock_saved_size)return ESP_ERR_NO_MEM;memcpy(data,mock_saved,mock_saved_size);}*size=mock_saved_size;return ESP_OK;}
-static esp_err_t nvs_set_u8(nvs_handle_t handle,const char *key,uint8_t value){(void)handle;(void)key;mock_enabled=value;return ESP_OK;}
-static esp_err_t nvs_get_u8(nvs_handle_t handle,const char *key,uint8_t *value){(void)handle;(void)key;*value=mock_enabled;return ESP_OK;}
-static esp_err_t nvs_set_i32(nvs_handle_t handle,const char *key,int32_t value){(void)handle;(void)key;(void)value;return ESP_OK;}
-static esp_err_t nvs_get_i32(nvs_handle_t handle,const char *key,int32_t *value){(void)handle;(void)key;(void)value;return ESP_ERR_NVS_NOT_FOUND;}
-static esp_err_t nvs_set_str(nvs_handle_t handle,const char *key,const char *value){(void)handle;(void)key;(void)value;return ESP_OK;}
-static esp_err_t nvs_get_str(nvs_handle_t handle,const char *key,char *value,size_t *size){(void)handle;(void)key;(void)value;(void)size;return ESP_ERR_NVS_NOT_FOUND;}
+static esp_err_t nvs_set_u8(nvs_handle_t handle,const char *key,uint8_t value){(void)handle;(void)key;mock_enabled=value;mock_enabled_present=true;return ESP_OK;}
+static esp_err_t nvs_get_u8(nvs_handle_t handle,const char *key,uint8_t *value){(void)handle;(void)key;if(!mock_enabled_present)return ESP_ERR_NVS_NOT_FOUND;*value=mock_enabled;return ESP_OK;}
+static esp_err_t nvs_set_i32(nvs_handle_t handle,const char *key,int32_t value){(void)handle;(void)key;mock_timezone=value;mock_timezone_present=true;return ESP_OK;}
+static esp_err_t nvs_get_i32(nvs_handle_t handle,const char *key,int32_t *value){(void)handle;(void)key;if(!mock_timezone_present)return ESP_ERR_NVS_NOT_FOUND;*value=mock_timezone;return ESP_OK;}
+static esp_err_t nvs_set_str(nvs_handle_t handle,const char *key,const char *value){(void)handle;(void)key;fake_strlcpy(mock_ntp_server,value,sizeof(mock_ntp_server));return ESP_OK;}
+static esp_err_t nvs_get_str(nvs_handle_t handle,const char *key,char *value,size_t *size){(void)handle;(void)key;if(!mock_ntp_server[0])return ESP_ERR_NVS_NOT_FOUND;size_t needed=strlen(mock_ntp_server)+1;if(*size<needed)return ESP_ERR_NO_MEM;memcpy(value,mock_ntp_server,needed);*size=needed;return ESP_OK;}
 static esp_err_t nvs_commit(nvs_handle_t handle){(void)handle;return mock_nvs_fail?ESP_ERR_NO_MEM:ESP_OK;}
 static esp_err_t nvs_erase_key(nvs_handle_t handle,const char *key){(void)handle;(void)key;mock_saved_size=0;return ESP_OK;}

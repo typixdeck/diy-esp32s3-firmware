@@ -38,7 +38,7 @@ shutil.copy2(app, application)
 manifest = {'version': version, 'chip': 'esp32s3', 'board': 'TypixDeck 0720',
     'hardware_verified': False, 'idf': '5.5.1', 'flash_settings': settings,
     'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
-    'images': {}, 'notice': 'Prerelease; hardware validation pending. Full image overwrites NVS including preferences and Wi-Fi credentials. App-only requires matching partition/font layout. Built from source; no device data included.'}
+    'images': {}, 'notice': 'Prerelease; hardware validation pending. Direct full-image writes overwrite NVS including preferences and Wi-Fi credentials. Copilot >=0.2.6 preserves NVS only with a signed preserve-diy-v1 policy, identical partition sector and compatible source app hash. App-only requires matching partition/font layout. Built from source; no device data included.'}
 for file in (application, full):
     manifest['images'][file.name] = {'bytes': file.stat().st_size, 'sha256': hashlib.sha256(file.read_bytes()).hexdigest(), 'offset': '0x0' if '-full.' in file.name else '0x10000'}
 (out/'manifest.json').write_text(json.dumps(manifest, indent=2, ensure_ascii=False)+'\n')
